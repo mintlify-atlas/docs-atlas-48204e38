@@ -1,0 +1,96 @@
+---
+title: "wace.Init: bootstrap WACElib plugins, logger, and NATS"
+description: "Bootstrap the WACElib engine once at startup: validates config, sets up the logger, and constructs the PluginManager that loads model and decision plugins."
+---
+
+`Init` is the single entry point that wires together the entire WACElib runtime. It must be called exactly once before any transaction is processed. Internally it calls `configstore.New()` to create the singleton config store, applies the supplied `ConfigFileData`, initialises the structured logger at the requested path and level, and then constructs the `PluginManager` which loads every model and decision `.so` plugin listed in the configuration.
+
+## Signature
+
+```go
+func Init(met metric.Meter, conf configstore.ConfigFileData) error
+```
+
+## Parameters
+
+<ParamField path="met" type="metric.Meter" required>
+  An OpenTelemetry `metric.Meter` used to record per-model histogram durations
+  (`wace.model.duration.nanoseconds`) and blocked-request counters
+  (`wace.client.request.blocked.total`). Obtain one from a
+  `metric.MeterProvider`.
+</ParamField>
+
+<ParamField path="conf" type="configstore.ConfigFileData" required>
+  Parsed configuration data. Typically populated by unmarshalling a YAML config
+  file into a `ConfigFileData` struct. See the
+  [configstore reference](/api/configstore) for all fields.
+</ParamField>
+
+## Return value
+
+Returns `nil` on success. Returns an error if:
+
+- A `ConfigStore` instance already exists (i.e. `Init` was called twice).
+- The configuration is invalid (bad log path, missing plugin paths, unknown plugin types).
+- The logger cannot open the log file.
+- The `PluginManager` fails to construct.
+
+## Example
+
+```go
+package main
+
+import (
+    "log"
+
+    wace "github.com/tilsor/ModSecIntl_wace_lib"
+    "github.com/tilsor/ModSecIntl_wace_lib/configstore"
+    "go.opentelemetry.io/otel/sdk/metric"
+    "gopkg.in/yaml.v3"
+    "os"
+)
+
+func main() {
+    // Build an OpenTelemetry meter
+    provider := metric.NewMeterProvider()
+    meter := provider.Meter("my-waf-service")
+
+    // Load config from YAML
+    raw, err := os.ReadFile("/etc/wace/config.yaml")
+    if err != nil {
+        log.Fatal(err)
+    }
+    var conf configstore.ConfigFileData
+    if err := yaml.Unmarshal(raw, &conf); err != nil {
+        log.Fatal(err)
+    }
+
+    // Initialise WACElib — call once at startup
+    if err := wace.Init(meter, conf); err != nil {
+        log.Fatalf("wace.Init failed: %v", err)
+    }
+}
+```
+
+## Startup sequence
+
+`Init` performs the following steps in order:
+
+1. Calls `configstore.New()` to create the singleton `ConfigStore`. Returns an error immediately if one already exists.
+2. Calls `cs.SetConfig(conf)` to validate and load the configuration into the store.
+3. Stores the `metric.Meter` reference for later use in transaction processing.
+4. Calls `logger.LoadLogger(cs.LogPath, cs.LogLevel)` to open the log file.
+5. Calls `pluginmanager.New(met)` to load all `.so` plugins declared in the configuration and establish NATS connections for async/remote plugins.
+
+<Warning>
+  Calling `Init` more than once returns an error because `configstore.New()`
+  enforces a singleton. If you need to re-initialise (e.g. in tests), call
+  `configstore.Clean()` first to reset the singleton.
+</Warning>
+
+<Note>
+  The `metric.Meter` instance you pass to `Init` is stored as a package-level
+  variable and reused for all subsequent transaction metrics. Pass a no-op meter
+  (e.g. `metric.NewMeterProvider().Meter("")`) during testing if you do not need
+  telemetry.
+</Note>

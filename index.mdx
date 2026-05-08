@@ -1,133 +1,57 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "WACElib: ML-assisted WAF for web attack prevention"
+description: "WACElib is a Go library that combines OWASP Core Rule Set knowledge with machine learning models to detect and block web attacks while reducing false positives."
 ---
 
-## Setting up
+WACElib is the core library of the WACE (WAF with Adaptive Classification Engine) project. It integrates machine learning model outputs with traditional WAF rule signals — like ModSecurity's OWASP Core Rule Set — to make smarter, more accurate blocking decisions for web transactions. Use WACElib directly in your Go application or via Coraza WAF integration.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get WACElib integrated and analyzing your first transaction in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand how WACE combines WAF signals with ML models.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Configuration" icon="gear" href="/configuration/overview">
+    Configure model plugins, decision plugins, and logging.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/init">
+    Explore the full Go API surface for WACElib.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## How WACElib works
 
-Everything you need to create world-class documentation.
+WACElib sits alongside your WAF, receiving HTTP transaction data and running it through one or more machine learning model plugins. After collecting model scores, a decision plugin combines those scores with WAF rule signals (such as anomaly scores from ModSecurity) to produce a final block/allow decision.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Initialize WACElib">
+    Call `Init` once at startup with your configuration and an OpenTelemetry meter.
+  </Step>
+  <Step title="Start a transaction">
+    Call `InitTransaction` with a unique transaction ID at the start of each HTTP request.
+  </Step>
+  <Step title="Analyze request and response parts">
+    Call `Analyze` one or more times — for request headers, request body, response headers, or response body — passing the relevant ML model IDs.
+  </Step>
+  <Step title="Check and close">
+    Call `CheckTransaction` to get the block/allow decision, then `CloseTransaction` to release resources.
+  </Step>
+</Steps>
 
-## Make your content agent ready
+## Key features
 
-Make your docs work for humans and AI agents alike.
-
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
+<CardGroup cols={2}>
+  <Card title="Plugin-based ML models" icon="puzzle-piece" href="/configuration/model-plugins">
+    Load Go shared-library plugins for any ML model. Swap or extend models without changing application code.
   </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
+  <Card title="Sync, async, and remote modes" icon="sliders" href="/guides/plugin-modes">
+    Run models synchronously in-process, asynchronously via NATS queues, or remotely on dedicated inference servers.
   </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
+  <Card title="Granular payload analysis" icon="magnifying-glass" href="/guides/transaction-lifecycle">
+    Analyze any subset of the HTTP transaction: request headers, request body, response headers, response body, or everything at once.
   </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
+  <Card title="OpenTelemetry observability" icon="chart-line" href="/api/init">
+    Built-in metrics for model latency and blocked request counts, compatible with any OpenTelemetry-compatible backend.
   </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+</CardGroup>

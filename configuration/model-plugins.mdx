@@ -1,0 +1,214 @@
+---
+title: "Model plugin configuration: fields, modes, and examples"
+description: "Configure model plugins to analyse specific HTTP transaction phases using compiled Go plugins, with sync, async, and remote execution via NATS."
+---
+
+Model plugins are compiled Go shared libraries (`.so` files) that WACElib loads at startup via `Init`. Each plugin is assigned to a specific portion of the HTTP transaction through its `plugintype`, and is invoked during a call to `Analyze`. The results from all model plugins accumulate per transaction and are later consumed by a decision plugin when `CheckTransaction` is called.
+
+## Field reference
+
+<ParamField body="id" type="string" required>
+  Unique identifier for this plugin instance. Used as the key in internal maps and as the argument to `Analyze` and NATS subject names. Must be unique across all entries in `modelplugins`.
+</ParamField>
+
+<ParamField body="path" type="string" required>
+  Filesystem path to the compiled `.so` plugin file. Must be an absolute or relative path that exists and is readable at the time `Init` is called. An empty or non-existent path causes `Init` to return an error.
+</ParamField>
+
+<ParamField body="plugintype" type="string" required>
+  Declares which part of the HTTP transaction this plugin handles. WACElib enforces that a plugin is only called with a matching payload type; a mismatch is logged as an error and the plugin is skipped for that call. Must be one of the values in the table below.
+</ParamField>
+
+<ParamField body="weight" type="number" default="0">
+  Numeric weight assigned to this plugin's result. Passed to the decision plugin in `DecisionInput.ModelWeight` so that decision logic can compute weighted scores across multiple models.
+</ParamField>
+
+<ParamField body="threshold" type="number" default="0">
+  Attack-probability threshold stored in the plugin configuration. Available to decision plugins through the model results; not enforced by WACElib core itself.
+</ParamField>
+
+<ParamField body="params" type="object">
+  Arbitrary key/value string map passed verbatim to the plugin's `InitPlugin` (or `InitPluginAsync`) function at load time. Use this to supply model-specific settings such as remote endpoint URLs or tuning parameters without modifying plugin source code.
+</ParamField>
+
+<ParamField body="mode" type="string" default="sync">
+  Execution mode for this plugin. Accepted values are `sync` and `async`.
+
+  - **`sync`** — WACElib waits for the plugin to return a result before `Analyze` completes for that call. The result is available to the decision plugin within the same request lifecycle.
+  - **`async`** — The plugin is dispatched via NATS and executes in a separate goroutine. Results may arrive after `CheckTransaction` has already been called, so they will not influence the current transaction's decision.
+</ParamField>
+
+<ParamField body="remote" type="boolean" default="false">
+  When `true`, the plugin is executed remotely over NATS rather than in-process. The payload is published to the NATS subject matching the plugin `id`, and results are received on `<id>/results`. Requires a running NATS server reachable at the configured `natsurl`.
+</ParamField>
+
+## Plugin type values
+
+The `plugintype` field controls which phase of the transaction triggers the plugin. Passing a payload of the wrong type to `Analyze` will cause the plugin to be skipped with an error log entry.
+
+| Value             | Transaction portion                              |
+| ----------------- | ------------------------------------------------ |
+| `RequestHeaders`  | HTTP request line and headers only               |
+| `RequestBody`     | HTTP request body only                           |
+| `AllRequest`      | Full HTTP request (headers + body)               |
+| `ResponseHeaders` | HTTP response status line and headers only       |
+| `ResponseBody`    | HTTP response body only                          |
+| `AllResponse`     | Full HTTP response (headers + body)              |
+| `Everything`      | Any payload type; plugin is invoked for all phases |
+
+## Execution mode and remote flag
+
+<Note>
+  The `mode` and `remote` fields interact. When `remote: true`, the plugin uses `InitPluginAsync` regardless of the `mode` value, because the payload is always dispatched over NATS. When `mode: async` and `remote: false`, the plugin also uses `InitPluginAsync` and dispatches via NATS internally. The only case where a plugin runs entirely in-process without NATS is `mode: sync` combined with `remote: false` (the default).
+</Note>
+
+## Configuration examples
+
+<Tabs>
+  <Tab title="Sync local">
+    Plugins execute in-process and block until results are returned. No NATS connection is required. This is the lowest-latency configuration for a single-node deployment.
+
+    ```yaml
+    ---
+    logpath: "/var/log/wace/wace.log"
+    loglevel: "WARN"
+    modelplugins:
+      - id: "trivial"
+        plugintype: RequestHeaders
+        path: "/opt/wace/plugins/model/trivial.so"
+        weight: 1
+        mode: sync
+      - id: "trivial2"
+        plugintype: RequestHeaders
+        path: "/opt/wace/plugins/model/trivial2.so"
+        weight: 2
+        mode: sync
+    decisionplugins:
+      - id: "simple"
+        path: "/opt/wace/plugins/decision/simple.so"
+        decisionbalance: 0.1
+    ```
+  </Tab>
+  <Tab title="Sync remote">
+    Plugins execute synchronously but offload inference to a remote worker over NATS. `CheckTransaction` still waits for results before making a decision.
+
+    ```yaml
+    ---
+    logpath: "/var/log/wace/wace.log"
+    loglevel: "WARN"
+    natsurl: "nats-server:4222"
+    modelplugins:
+      - id: "trivial"
+        plugintype: RequestHeaders
+        path: "/opt/wace/plugins/model/trivial.so"
+        weight: 1
+        mode: sync
+        remote: true
+      - id: "trivial2"
+        plugintype: RequestHeaders
+        path: "/opt/wace/plugins/model/trivial2.so"
+        weight: 2
+        mode: sync
+        remote: true
+    decisionplugins:
+      - id: "simple"
+        path: "/opt/wace/plugins/decision/simple.so"
+        decisionbalance: 0.1
+    ```
+  </Tab>
+  <Tab title="Async">
+    Plugins are dispatched asynchronously over NATS. Results arrive after `CheckTransaction` and do not influence the current transaction's block decision. Useful for offline logging or training pipelines that do not need to gate the response.
+
+    ```yaml
+    ---
+    logpath: "/var/log/wace/wace.log"
+    loglevel: "WARN"
+    natsurl: "nats-server:4222"
+    modelplugins:
+      - id: "trivial"
+        plugintype: RequestHeaders
+        path: "/opt/wace/plugins/model/trivial.so"
+        weight: 1
+        mode: async
+      - id: "trivial2"
+        plugintype: RequestHeaders
+        path: "/opt/wace/plugins/model/trivial2.so"
+        weight: 2
+        mode: async
+    decisionplugins:
+      - id: "simple"
+        path: "/opt/wace/plugins/decision/simple.so"
+        decisionbalance: 0.1
+    ```
+  </Tab>
+</Tabs>
+
+## All plugin types in one configuration
+
+The following example registers one plugin per `plugintype`. Each plugin is called only when `Analyze` is invoked with the matching type string.
+
+```yaml
+---
+logpath: "/var/log/wace/wace.log"
+loglevel: "WARN"
+modelplugins:
+  - id: "trivialRequestHeaders"
+    plugintype: RequestHeaders
+    path: "/opt/wace/plugins/model/trivial.so"
+    weight: 0.1
+    mode: sync
+  - id: "trivialRequestBody"
+    plugintype: RequestBody
+    path: "/opt/wace/plugins/model/trivial.so"
+    weight: 0.1
+    mode: sync
+  - id: "trivialAllRequest"
+    plugintype: AllRequest
+    path: "/opt/wace/plugins/model/trivial.so"
+    weight: 0.1
+    mode: sync
+  - id: "trivialResponseHeaders"
+    plugintype: ResponseHeaders
+    path: "/opt/wace/plugins/model/trivial.so"
+    weight: 0.1
+    mode: sync
+  - id: "trivialResponseBody"
+    plugintype: ResponseBody
+    path: "/opt/wace/plugins/model/trivial.so"
+    weight: 0.1
+    mode: sync
+  - id: "trivialAllResponse"
+    plugintype: AllResponse
+    path: "/opt/wace/plugins/model/trivial.so"
+    weight: 0.1
+    mode: sync
+decisionplugins:
+  - id: "simple"
+    path: "/opt/wace/plugins/decision/simple.so"
+    decisionbalance: 0.1
+```
+
+## Plugin interface contract
+
+WACElib loads plugins via Go's `plugin` package. Depending on the `mode` and `remote` settings, WACElib looks up different exported symbols.
+
+**Sync local** (`mode: sync`, `remote: false`):
+
+```go
+func InitPlugin(params map[string]string, meter metric.Meter) error
+func Process(input pluginmanager.ModelInput) (pluginmanager.ModelResults, error)
+```
+
+**Async or remote** (`mode: async` or `remote: true`):
+
+```go
+func InitPluginAsync(
+    params map[string]string,
+    meter metric.Meter,
+    register func(func(pluginmanager.ModelInput) (pluginmanager.ModelResults, error)),
+) error
+```
+
+<Warning>
+  If the required exported symbol is missing or has an incorrect signature, the plugin fails to load and WACElib logs a warning. The library continues initialising with the remaining plugins — it does not abort. Verify plugin loading by checking log output at `INFO` level after calling `Init`.
+</Warning>

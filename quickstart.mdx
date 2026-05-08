@@ -1,81 +1,290 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "WACElib quickstart: run your first WAF transaction"
+description: "Add WACElib to a Go project, configure model and decision plugins, and run a complete HTTP transaction lifecycle in under ten minutes."
 ---
 
-## Get started in three steps
+This guide walks you through adding WACElib to a Go module, writing a minimal YAML configuration, and executing the full `Init` → `InitTransaction` → `Analyze` → `CheckTransaction` → `CloseTransaction` lifecycle against a sample HTTP request. By the end you will have a working integration you can adapt to your WAF middleware.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+- Go 1.21 or later
+- A running NATS server (default `localhost:4222`) — WACElib dials NATS at startup. For synchronous in-process plugins it logs a warning if the connection fails but continues operating; async and remote plugins require a live NATS connection.
+- At least one compiled model plugin (`.so`) and one compiled decision plugin (`.so`). See the [model plugin interface](/api/model-plugin-interface) and [decision plugin interface](/api/decision-plugin-interface) for how to build them.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<Steps>
 
-### Step 2: Deploy your changes
+<Step title="Add the module dependency">
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+Fetch the WACElib module:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash
+go get github.com/tilsor/ModSecIntl_wace_lib
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+Your `go.mod` will include an entry like:
 
-### Step 3: Go live
+```text
+require (
+    github.com/tilsor/ModSecIntl_wace_lib v0.0.0-latest
+)
+```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+</Step>
 
-## Next steps
+<Step title="Write a YAML configuration file">
 
-Now that you have your docs running, explore these key features:
+Create a `wace.yaml` file that declares your model plugins and decision plugin. The top-level keys map directly to `configstore.ConfigFileData`.
 
-<CardGroup cols={2}>
+```yaml
+logpath: "/var/log/wace.log"
+loglevel: "INFO"
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+modelplugins:
+  - id: "headers-model"
+    path: "/opt/wace/plugins/model/headers_model.so"
+    plugintype: "RequestHeaders"
+    weight: 1.0
+    mode: sync
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+  - id: "body-model"
+    path: "/opt/wace/plugins/model/body_model.so"
+    plugintype: "RequestBody"
+    weight: 1.0
+    mode: sync
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+decisionplugins:
+  - id: "weighted-decision"
+    path: "/opt/wace/plugins/decision/weighted.so"
+    wafweight: 0.5
+    decisionbalance: 0.5
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  The `plugintype` string must exactly match one of the `ModelPluginType` enum values: `RequestHeaders`, `RequestBody`, `AllRequest`, `ResponseHeaders`, `ResponseBody`, `AllResponse`, or `Everything`. An unrecognized value causes `Init` to return an error.
 </Note>
+
+</Step>
+
+<Step title="Initialize WACElib at startup">
+
+Parse the YAML into a `configstore.ConfigFileData` struct and pass it to `wace.Init` together with an OpenTelemetry `metric.Meter`. Call `Init` exactly once when your process starts — calling it a second time returns an error because the internal `ConfigStore` is a singleton.
+
+```go
+package main
+
+import (
+    "log"
+    "os"
+
+    wace "github.com/tilsor/ModSecIntl_wace_lib"
+    "github.com/tilsor/ModSecIntl_wace_lib/configstore"
+
+    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+    "gopkg.in/yaml.v3"
+)
+
+func main() {
+    // Read and parse the configuration file.
+    raw, err := os.ReadFile("wace.yaml")
+    if err != nil {
+        log.Fatalf("failed to read config: %v", err)
+    }
+
+    var conf configstore.ConfigFileData
+    if err := yaml.Unmarshal(raw, &conf); err != nil {
+        log.Fatalf("failed to parse config: %v", err)
+    }
+
+    // Create an OpenTelemetry MeterProvider and Meter.
+    // Replace this with your production provider (e.g. an OTLP exporter).
+    provider := sdkmetric.NewMeterProvider()
+    meter := provider.Meter("my-waf-service")
+
+    // Initialize WACElib. This loads all plugin .so files and connects to NATS.
+    if err := wace.Init(meter, conf); err != nil {
+        log.Fatalf("wace.Init failed: %v", err)
+    }
+
+    log.Println("WACElib initialized")
+    // ... start your WAF middleware
+}
+```
+
+</Step>
+
+<Step title="Run the transaction lifecycle for each request">
+
+For every HTTP transaction your WAF intercepts, follow the four-step per-request pattern. The example below mirrors the structure of `TestCheckAttackTransaction` in `wacecore_test.go`.
+
+```go
+package middleware
+
+import (
+    "fmt"
+    "strings"
+
+    wace "github.com/tilsor/ModSecIntl_wace_lib"
+    "github.com/tilsor/ModSecIntl_wace_lib/pluginmanager"
+)
+
+// AnalyzeRequest runs WACElib analysis for one HTTP transaction and
+// returns true if the request should be blocked.
+func AnalyzeRequest(transactionID string, wafParams map[string]string) (bool, error) {
+
+    // Step 1: Open a new transaction slot in WACElib.
+    wace.InitTransaction(transactionID)
+
+    // Step 2: Dispatch request-headers models concurrently.
+    // The modelsTypeAsString argument must match the PluginType of each listed model.
+    headersPayload := pluginmanager.HTTPPayload{
+        URI:         "/api/v1/resource",
+        Method:      "POST",
+        HTTPVersion: "HTTP/1.1",
+        RequestHeaders: []pluginmanager.HTTPHeader{
+            {Key: "User-Agent", Value: "Mozilla/5.0"},
+            {Key: "Content-Type", Value: "application/json"},
+            {Key: "Host", Value: "example.com"},
+        },
+    }
+
+    if err := wace.Analyze("RequestHeaders", transactionID, headersPayload, []string{"headers-model"}); err != nil {
+        wace.CloseTransaction(transactionID)
+        return false, fmt.Errorf("Analyze RequestHeaders: %w", err)
+    }
+
+    // Step 3: Dispatch request-body models concurrently.
+    bodyPayload := pluginmanager.HTTPPayload{
+        RequestBody: `{"username": "admin", "password": "' OR 1=1 --"}`,
+    }
+
+    if err := wace.Analyze("RequestBody", transactionID, bodyPayload, []string{"body-model"}); err != nil {
+        wace.CloseTransaction(transactionID)
+        return false, fmt.Errorf("Analyze RequestBody: %w", err)
+    }
+
+    // Step 4: Block until all dispatched models finish, then call the
+    // decision plugin with WAF anomaly scores.
+    block, err := wace.CheckTransaction(transactionID, "weighted-decision", wafParams)
+    if err != nil {
+        wace.CloseTransaction(transactionID)
+        return false, fmt.Errorf("CheckTransaction: %w", err)
+    }
+
+    // Step 5: Release all per-transaction state and channels.
+    wace.CloseTransaction(transactionID)
+
+    return block, nil
+}
+```
+
+<Tip>
+  Always call `CloseTransaction` — even on error paths. Omitting it leaks the transaction's channel and result map for the lifetime of the process. Use `defer wace.CloseTransaction(transactionID)` immediately after `InitTransaction` to make this automatic.
+</Tip>
+
+</Step>
+
+<Step title="Build the wafParams map from CRS scores">
+
+`CheckTransaction` accepts a `map[string]string` of WAF parameters that the decision plugin reads alongside the ML scores. In a ModSecurity or Coraza integration, these values come from the CRS anomaly scoring variables in the transaction's `TX` collection:
+
+```go
+// Parse CRS anomaly score key=value pairs into the map that
+// CheckTransaction passes to the decision plugin.
+wafParams := make(map[string]string)
+scoreString := "COMBINED_SCORE=12,SQLI=10,XSS=2,inbound_blocking=20,inbound_threshold=5"
+for _, pair := range strings.Split(scoreString, ",") {
+    parts := strings.SplitN(pair, "=", 2)
+    if len(parts) == 2 {
+        wafParams[parts[0]] = parts[1]
+    }
+}
+
+block, err := wace.CheckTransaction(transactionID, "weighted-decision", wafParams)
+```
+
+The exact keys your decision plugin expects depend on how that plugin is implemented. The `simple` decision plugin used in the test suite reads `inbound_blocking` and `inbound_threshold`, among others.
+
+</Step>
+
+</Steps>
+
+## Complete minimal example
+
+The following self-contained program combines all of the steps above. It follows the same initialization pattern as the library's `initilize` test helper and the same transaction flow as `TestCheckAttackTransaction` in `wacecore_test.go`.
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "os"
+    "strings"
+
+    wace "github.com/tilsor/ModSecIntl_wace_lib"
+    "github.com/tilsor/ModSecIntl_wace_lib/configstore"
+    "github.com/tilsor/ModSecIntl_wace_lib/pluginmanager"
+
+    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+    "gopkg.in/yaml.v3"
+)
+
+func main() {
+    raw, err := os.ReadFile("wace.yaml")
+    if err != nil {
+        log.Fatalf("read config: %v", err)
+    }
+    var conf configstore.ConfigFileData
+    if err := yaml.Unmarshal(raw, &conf); err != nil {
+        log.Fatalf("parse config: %v", err)
+    }
+
+    provider := sdkmetric.NewMeterProvider()
+    meter := provider.Meter("example")
+
+    if err := wace.Init(meter, conf); err != nil {
+        log.Fatalf("wace.Init: %v", err)
+    }
+
+    // Per-request lifecycle
+    txID := "TX-001"
+    wace.InitTransaction(txID)
+    defer wace.CloseTransaction(txID)
+
+    payload := pluginmanager.HTTPPayload{
+        URI:         "/cgi-bin/process.cgi",
+        Method:      "POST",
+        HTTPVersion: "HTTP/1.1",
+        RequestHeaders: []pluginmanager.HTTPHeader{
+            {Key: "User-Agent", Value: "Mozilla/4.0 (compatible; MSIE5.01; Windows NT)"},
+            {Key: "Host", Value: "www.example.com"},
+            {Key: "Content-Type", Value: "application/x-www-form-urlencoded"},
+        },
+        RequestBody: "licenseID=string&content=string&/paramsXML=string",
+    }
+
+    if err := wace.Analyze("RequestHeaders", txID, payload, []string{"headers-model"}); err != nil {
+        log.Fatalf("Analyze: %v", err)
+    }
+
+    wafParams := make(map[string]string)
+    for _, pair := range strings.Split(
+        "COMBINED_SCORE=0,SQLI=0,XSS=0,inbound_blocking=20,inbound_threshold=5", ",") {
+        parts := strings.SplitN(pair, "=", 2)
+        if len(parts) == 2 {
+            wafParams[parts[0]] = parts[1]
+        }
+    }
+
+    block, err := wace.CheckTransaction(txID, "weighted-decision", wafParams)
+    if err != nil {
+        log.Fatalf("CheckTransaction: %v", err)
+    }
+
+    fmt.Printf("Block request: %v\n", block)
+}
+```
+
+<Warning>
+  `wace.Init` initializes a process-global singleton. In tests, call `configstore.Clean()` with `defer` at the top of each test function to reset state between runs — exactly as the library's own test suite does.
+</Warning>

@@ -1,0 +1,179 @@
+---
+title: "Decision plugin configuration: fields and WAF params"
+description: "Configure decision plugins to receive aggregated model results and OWASP CRS WAF signals, then return a block or allow verdict for each transaction."
+---
+
+Decision plugins are compiled Go shared libraries (`.so` files) responsible for producing the final block/allow verdict for each transaction. When `CheckTransaction` is called, WACElib waits for all synchronous model plugins to finish, collects their results, and passes everything to the named decision plugin's `CheckResults` function. The decision plugin receives both the ML model outputs and any WAF scoring parameters forwarded from the OWASP Core Rule Set, allowing it to combine signals from both sources before deciding.
+
+## Field reference
+
+<ParamField body="id" type="string" required>
+  Unique identifier for this decision plugin instance. Passed as the second argument to `CheckTransaction` to select which plugin evaluates the transaction.
+</ParamField>
+
+<ParamField body="path" type="string" required>
+  Filesystem path to the compiled `.so` decision plugin file. Must exist and be readable when `Init` is called. An empty or non-existent path causes `Init` to return an error.
+</ParamField>
+
+<ParamField body="wafweight" type="number" default="0">
+  Numeric weight given to WAF signals relative to model outputs. The interpretation is left to the plugin implementation; WACElib stores the value and makes it accessible during plugin initialisation via `params`, but does not enforce any semantics on it directly.
+
+  <Note>
+    In the YAML representation the key is `wafweight` (all lowercase). In the Go struct `configFileDecisionPlugin` the corresponding fields `wafweight` and `decisionbalance` are unexported, so they are populated only via YAML unmarshalling — they cannot be set programmatically from outside the package.
+  </Note>
+</ParamField>
+
+<ParamField body="decisionbalance" type="number" default="0">
+  Balance factor between WAF signals and model predictions. As with `wafweight`, the exact meaning is defined by the plugin; WACElib passes the value through unchanged.
+</ParamField>
+
+<ParamField body="params" type="object">
+  Arbitrary key/value string map passed verbatim to the plugin's `InitPlugin` function at load time. Use this to supply plugin-specific configuration without modifying plugin source code.
+</ParamField>
+
+## The DecisionInput struct
+
+When `CheckTransaction` calls a decision plugin, it constructs a `DecisionInput` value from `pluginmanager` and passes it to `CheckResults`. Understanding the struct is essential for writing correct decision logic.
+
+```go
+// DecisionInput is the struct that contains the input data for the decision plugin
+type DecisionInput struct {
+    TransactionId string
+    Results       map[string]ModelResults
+    ModelWeight   map[string]float64
+    WAFdata       map[string]string
+}
+```
+
+| Field           | Type                        | Description |
+| --------------- | --------------------------- | ----------- |
+| `TransactionId` | `string`                    | The transaction ID passed to `InitTransaction`. |
+| `Results`       | `map[string]ModelResults`   | Map of model plugin ID to its result. Only contains results from model plugins that completed before `CheckTransaction` was called (i.e. sync plugins only). |
+| `ModelWeight`   | `map[string]float64`        | Map of model plugin ID to the `weight` value from its configuration. Keys match `Results`. |
+| `WAFdata`       | `map[string]string`         | The `wafParams` map passed directly to `CheckTransaction` by the caller — typically OWASP CRS anomaly scores. |
+
+`ModelResults` is also defined in `pluginmanager`:
+
+```go
+type ModelResults struct {
+    ProbAttack float64                `json:"probattack"`
+    Data       map[string]interface{} `json:"data"`
+}
+```
+
+`ProbAttack` is a value between 0 and 1 representing the model's estimated probability that the transaction is an attack. `Data` carries any additional structured output the model plugin chooses to return.
+
+## WAF parameters
+
+The `WAFdata` field in `DecisionInput` contains the key/value map supplied by the WAF integration layer — for example, OWASP CRS anomaly scoring variables forwarded from ModSecurity or Coraza. A representative set of keys looks like:
+
+```
+COMBINED_SCORE, HTTP, LFI, PHPI, RCE, RFI, SESS, SQLI, XSS,
+inbound_blocking, inbound_detection, inbound_per_pl, inbound_threshold,
+outbound_blocking, outbound_detection, outbound_per_pl, outbound_threshold,
+phase
+```
+
+The decision plugin can read any of these values by key. The `simple` reference plugin, for example, reads `inbound_blocking` and `inbound_threshold` to determine whether Coraza is recommending a block:
+
+```go
+func CheckResults(decisionInput pm.DecisionInput) (bool, error) {
+    // ...accumulate model scores...
+    if len(decisionInput.WAFdata) != 0 {
+        as, _ := strconv.Atoi(decisionInput.WAFdata["inbound_blocking"])
+        it, _ := strconv.Atoi(decisionInput.WAFdata["inbound_threshold"])
+        if as >= it && totalModelProb > 0.5 {
+            return true, nil // WAF wants to block and models agree
+        }
+    }
+    return false, nil
+}
+```
+
+## Configuration examples
+
+### Minimal decision plugin
+
+```yaml
+decisionplugins:
+  - id: "simple"
+    path: "/opt/wace/plugins/decision/simple.so"
+```
+
+### With WAF and balance weights
+
+```yaml
+decisionplugins:
+  - id: "simple"
+    path: "/opt/wace/plugins/decision/simple.so"
+    wafweight: 0.5
+    decisionbalance: 0.5
+```
+
+### Full configuration with model plugins
+
+The following is a complete working configuration combining two model plugins and one decision plugin, taken from the WACElib test suite:
+
+```yaml
+---
+logpath: "/dev/null"
+loglevel: DEBUG
+modelplugins:
+  - id: "trivial"
+    path: "testdata/plugins/model/trivial.so"
+    weight: 1
+    params:
+      d: "sds"
+      b: "dnid"
+      e: "dofnno"
+    plugintype: "Everything"
+  - id: "trivial2"
+    path: "testdata/plugins/model/trivial2.so"
+    weight: 2
+    params:
+      a: "sdsds"
+      b: "sdfjdnid"
+      c: "kfoskdofnno"
+    plugintype: "Everything"
+decisionplugins:
+  - id: "simple"
+    path: "testdata/plugins/decision/simple.so"
+    wafweight: 0.5
+    decisionbalance: 0.5
+```
+
+## Plugin interface contract
+
+Decision plugins must export two functions. WACElib looks them up by name at load time via Go's `plugin` package.
+
+```go
+// Called once during Init. Use params for plugin-specific configuration.
+func InitPlugin(params map[string]string, meter metric.Meter) error
+
+// Called once per CheckTransaction invocation.
+// Returns true to block the transaction, false to allow it.
+func CheckResults(input pluginmanager.DecisionInput) (bool, error)
+```
+
+<Warning>
+  If `InitPlugin` or `CheckResults` is missing or has an incompatible signature, the plugin silently fails to load and `CheckTransaction` will return an error for any transaction that names it. Always verify plugin loading in the log output at `INFO` level immediately after calling `Init`.
+</Warning>
+
+## Calling CheckTransaction
+
+Pass WAF scoring parameters as the third argument. An empty map is valid and causes `WAFdata` to be empty inside the plugin.
+
+```go
+// Block decision based on model results only (no WAF params)
+blocked, err := wace.CheckTransaction(transactionID, "simple", make(map[string]string))
+
+// Block decision combining models with CRS anomaly scores
+wafParams := map[string]string{
+    "inbound_blocking":   "20",
+    "inbound_threshold":  "5",
+    "outbound_blocking":  "0",
+    "outbound_threshold": "4",
+    "COMBINED_SCORE":     "20",
+}
+blocked, err = wace.CheckTransaction(transactionID, "simple", wafParams)
+```

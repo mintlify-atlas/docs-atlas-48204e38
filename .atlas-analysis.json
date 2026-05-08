@@ -1,0 +1,94 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "WACElib",
+  "projectDescription": "A Go library providing machine learning-assisted web application firewall mechanisms that combine OWASP Core Rule Set (ModSecurity) with ML models to identify, analyze, and prevent web attacks while reducing false positives.",
+  "theme": "luma",
+  "primaryColor": "#0c9ed9",
+  "lightColor": "#0474a6",
+  "darkColor": "#65c9ef",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/overview",
+              "configuration/model-plugins",
+              "configuration/decision-plugins"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/transaction-lifecycle",
+              "guides/plugin-modes",
+              "guides/integrations"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/init",
+              "api/transactions",
+              "api/analyze"
+            ]
+          },
+          {
+            "group": "Packages",
+            "pages": [
+              "api/configstore",
+              "api/pluginmanager"
+            ]
+          },
+          {
+            "group": "Plugin Development",
+            "pages": [
+              "api/model-plugin-interface",
+              "api/decision-plugin-interface"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "ML-assisted WAF analysis combining ModSecurity CRS with machine learning models",
+    "Plugin-based architecture supporting custom model and decision plugins",
+    "Support for sync, async, and remote model execution modes",
+    "NATS-based messaging for distributed async model processing",
+    "Per-transaction analysis lifecycle with concurrent model execution",
+    "OpenTelemetry metrics integration for observability",
+    "Granular HTTP payload analysis (request headers, body, response headers, response body)"
+  ],
+  "publicApiSurface": [
+    "Init(met metric.Meter, conf configstore.ConfigFileData) error",
+    "InitTransaction(transactionId string)",
+    "Analyze(modelsTypeAsString, transactionId string, payload pluginmanager.HTTPPayload, models []string) error",
+    "CheckTransaction(transactionID, decisionPlugin string, wafParams map[string]string) (bool, error)",
+    "CloseTransaction(transactionID string)",
+    "configstore.New() (*ConfigStore, error)",
+    "configstore.Get() (*ConfigStore, error)",
+    "configstore.ConfigFileData struct",
+    "configstore.ModelPluginType enum (RequestHeaders, RequestBody, AllRequest, ResponseHeaders, ResponseBody, AllResponse, Everything)",
+    "pluginmanager.HTTPPayload struct",
+    "pluginmanager.HTTPHeader struct",
+    "pluginmanager.ModelInput struct",
+    "pluginmanager.ModelResults struct",
+    "pluginmanager.DecisionInput struct"
+  ]
+}

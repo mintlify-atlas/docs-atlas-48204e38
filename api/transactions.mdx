@@ -1,0 +1,97 @@
+---
+title: "Transaction management: InitTransaction and CloseTransaction"
+description: "Manage WAF transaction lifecycles in WACElib — InitTransaction opens state for a request ID, CloseTransaction frees it after analysis and decision."
+---
+
+WACElib tracks every HTTP transaction through a pair of lifecycle functions. `InitTransaction` allocates the internal synchronisation state and plugin result storage for a given transaction ID. `CloseTransaction` tears everything down, closing channels and freeing maps so that memory does not leak across requests. Every call to `InitTransaction` must be paired with exactly one call to `CloseTransaction`, even if analysis or checking fails.
+
+## InitTransaction
+
+### Signature
+
+```go
+func InitTransaction(transactionId string)
+```
+
+### What it does
+
+1. Starts a new logging context for `transactionId`.
+2. Creates a `transactionSync` value with an unbuffered `Channel` and `Counter` set to `0`, and stores it in the package-level `analysisMap`.
+3. Calls `plugins.InitTransaction(transactionId)` on the `PluginManager`, which allocates a `sync.Map` in the results store keyed by the transaction ID.
+
+### Parameters
+
+<ParamField path="transactionId" type="string" required>
+  An opaque, caller-supplied identifier that must be unique for the lifetime of
+  the transaction. UUIDs, hex strings, or any collision-resistant ID are
+  suitable. The same value must be passed to every subsequent `Analyze`,
+  `CheckTransaction`, and `CloseTransaction` call for this request.
+</ParamField>
+
+---
+
+## CloseTransaction
+
+### Signature
+
+```go
+func CloseTransaction(transactionID string)
+```
+
+### What it does
+
+1. Calls `plugins.CloseTransaction(transactionID)` on the `PluginManager`, which closes all sync model status channels and deletes per-transaction results from the results store.
+2. Loads the `transactionSync` from `analysisMap`, closes its `Channel`, drains any remaining messages, and deletes the entry from `analysisMap`.
+
+### Parameters
+
+<ParamField path="transactionID" type="string" required>
+  The same transaction identifier passed to `InitTransaction`.
+</ParamField>
+
+---
+
+## Paired usage pattern
+
+Always wrap `CloseTransaction` in a `defer` so it runs even when errors occur in the analysis path.
+
+```go
+transactionID := generateRequestID() // e.g. a UUID
+
+wace.InitTransaction(transactionID)
+defer wace.CloseTransaction(transactionID)
+
+err := wace.Analyze("RequestHeaders", transactionID, payload, []string{"model-a"})
+if err != nil {
+    log.Printf("analysis error: %v", err)
+    return
+}
+
+blocked, err := wace.CheckTransaction(transactionID, "simple", wafParams)
+if err != nil {
+    log.Printf("check error: %v", err)
+    return
+}
+
+if blocked {
+    // reject the request
+}
+```
+
+<Warning>
+  Failing to call `CloseTransaction` leaks goroutines and memory. The
+  `analysisMap` and the plugin manager's results store will retain entries for
+  every unclosed transaction for the lifetime of the process.
+</Warning>
+
+<Note>
+  `InitTransaction` and `CloseTransaction` are not safe to call concurrently
+  for the same `transactionID`. Each transaction ID must have its lifecycle
+  managed by a single goroutine, though different transaction IDs can be managed
+  in separate goroutines simultaneously.
+</Note>
+
+<Tip>
+  In tests, call `configstore.Clean()` after each test case that calls
+  `wace.Init` to reset the singleton and avoid state leaking between tests.
+</Tip>

@@ -1,0 +1,212 @@
+---
+title: "Integrating WACElib with Coraza WAF and ModSecurity"
+description: "Learn how to embed WACElib as a Go library inside a Coraza WAF middleware, or expose it over gRPC for integration with ModSecurity and other WAF frameworks."
+---
+
+WACElib is designed to augment existing WAF frameworks with ML-assisted decision making, not replace them. It receives structured signal data from your WAF — such as OWASP Core Rule Set anomaly scores — through the `wafParams` argument to `CheckTransaction`, and passes that data to the configured decision plugin alongside ML model outputs. This means WACElib sits **inside** your WAF's request pipeline, enriching its analysis rather than acting as a standalone proxy.
+
+## Integration patterns
+
+<CardGroup cols={2}>
+  <Card title="Go library with Coraza" icon="code">
+    Embed WACElib directly as a Go package inside a Coraza WAF middleware. WACElib's transaction functions (`InitTransaction`, `Analyze`, `CheckTransaction`, `CloseTransaction`) are called from within Coraza's rule evaluation hooks. Best for Go-native deployments.
+  </Card>
+  <Card title="gRPC server for ModSecurity" icon="server">
+    Wrap WACElib in a gRPC server and call it from ModSecurity's Lua or C++ connectors. ModSecurity invokes WACElib over the network at each phase boundary, passing CRS scores as gRPC request fields that become the `wafParams` map. Suitable for Nginx/Apache deployments.
+  </Card>
+</CardGroup>
+
+## Passing WAF parameters to CheckTransaction
+
+The `wafParams map[string]string` argument to `CheckTransaction` carries WAF signal data into the decision plugin. These key-value pairs are available to the decision plugin's `CheckResults(DecisionInput) (bool, error)` function via `DecisionInput.WAFdata`.
+
+```go
+func CheckTransaction(transactionID, decisionPlugin string, wafParams map[string]string) (bool, error)
+```
+
+The decision plugin interprets these values — WACElib's core passes them through without modification.
+
+### CRS anomaly score keys
+
+The following keys correspond to the standard OWASP CRS anomaly scoring fields. These are the keys used in the test suite and expected by the bundled `simple` decision plugin:
+
+```go
+wafParams := map[string]string{
+    // Anomaly score totals
+    "COMBINED_SCORE": "12",
+    "HTTP":           "0",
+    "LFI":            "0",
+    "PHPI":           "0",
+    "RCE":            "0",
+    "RFI":            "0",
+    "SESS":           "0",
+    "SQLI":           "5",
+    "XSS":            "7",
+
+    // Inbound (request) policy
+    "inbound_blocking":   "1",
+    "inbound_detection":  "0",
+    "inbound_per_pl":     "5-0-0-0",
+    "inbound_threshold":  "5",
+
+    // Outbound (response) policy
+    "outbound_blocking":  "0",
+    "outbound_detection": "0",
+    "outbound_per_pl":    "0-0-0-0",
+    "outbound_threshold": "4",
+
+    // Current processing phase (1–4 for ModSecurity phases)
+    "phase": "2",
+}
+```
+
+### Building wafParams from CRS scores
+
+In practice you parse the raw CRS anomaly score string — a comma-separated `key=value` list emitted by the CRS rule set — into the map:
+
+```go
+import "strings"
+
+func buildWAFParams(crsScoreString string) map[string]string {
+    wafParams := make(map[string]string)
+    for _, pair := range strings.Split(crsScoreString, ",") {
+        parts := strings.SplitN(pair, "=", 2)
+        if len(parts) == 2 {
+            wafParams[parts[0]] = parts[1]
+        }
+    }
+    return wafParams
+}
+
+// Example CRS score string from ModSecurity TX variables:
+// "COMBINED_SCORE=12,HTTP=0,LFI=0,PHPI=0,RCE=0,RFI=0,SESS=0,SQLI=5,XSS=7,
+//  inbound_blocking=1,inbound_detection=0,inbound_per_pl=5-0-0-0,inbound_threshold=5,
+//  outbound_blocking=0,outbound_detection=0,outbound_per_pl=0-0-0-0,outbound_threshold=4,phase=2"
+wafParams := buildWAFParams(rawScoreString)
+blocked, err := wace.CheckTransaction(transactionID, "simple", wafParams)
+```
+
+## Coraza middleware pattern
+
+The following example shows where WACElib calls fit inside a Coraza HTTP middleware. Coraza fires callbacks at each WAF phase; WACElib is invoked at those same points to score the payload and check against ML model outputs.
+
+```go
+package middleware
+
+import (
+    "net/http"
+    "strings"
+
+    wace "github.com/tilsor/ModSecIntl_wace_lib"
+    "github.com/tilsor/ModSecIntl_wace_lib/pluginmanager"
+)
+
+// WAFMiddleware wraps an http.Handler with Coraza + WACElib analysis.
+func WAFMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        transactionID := generateTransactionID()
+        wace.InitTransaction(transactionID)
+        defer wace.CloseTransaction(transactionID) // always clean up
+
+        // --- Phase 1: request headers ---
+        headerPayload := pluginmanager.HTTPPayload{
+            URI:         r.URL.RequestURI(),
+            Method:      r.Method,
+            HTTPVersion: r.Proto,
+            RequestHeaders: httpHeadersToWACE(r.Header),
+        }
+        _ = wace.Analyze("RequestHeaders", transactionID, headerPayload, []string{"headersModel"})
+
+        // Collect CRS scores from Coraza after phase 1 rule evaluation
+        phase1Params := buildWAFParams(corazaGetScores(r, 1))
+        blocked, err := wace.CheckTransaction(transactionID, "simple", phase1Params)
+        if err != nil || blocked {
+            http.Error(w, "Forbidden", http.StatusForbidden)
+            return
+        }
+
+        // --- Phase 2: request body ---
+        bodyPayload := pluginmanager.HTTPPayload{
+            RequestBody: readRequestBody(r),
+        }
+        _ = wace.Analyze("RequestBody", transactionID, bodyPayload, []string{"bodyModel"})
+
+        phase2Params := buildWAFParams(corazaGetScores(r, 2))
+        blocked, err = wace.CheckTransaction(transactionID, "simple", phase2Params)
+        if err != nil || blocked {
+            http.Error(w, "Forbidden", http.StatusForbidden)
+            return
+        }
+
+        // Pass the request to the next handler
+        next.ServeHTTP(w, r)
+    })
+}
+
+func httpHeadersToWACE(h http.Header) []pluginmanager.HTTPHeader {
+    headers := make([]pluginmanager.HTTPHeader, 0, len(h))
+    for key, values := range h {
+        headers = append(headers, pluginmanager.HTTPHeader{
+            Key:   key,
+            Value: strings.Join(values, ", "),
+        })
+    }
+    return headers
+}
+
+func buildWAFParams(raw string) map[string]string {
+    params := make(map[string]string)
+    for _, pair := range strings.Split(raw, ",") {
+        if parts := strings.SplitN(pair, "=", 2); len(parts) == 2 {
+            params[parts[0]] = parts[1]
+        }
+    }
+    return params
+}
+```
+
+## gRPC server pattern for ModSecurity
+
+When integrating with ModSecurity (Nginx/Apache), WACElib is wrapped in a gRPC server. The server exposes an RPC per phase; the caller (a ModSecurity Lua script or connector) passes the request payload and CRS scores as fields in the request proto, and the server maps them to `wafParams` before calling `CheckTransaction`.
+
+```go
+// Conceptual gRPC handler — adapt to your proto definition
+func (s *WACEServer) AnalyzePhase(ctx context.Context, req *pb.AnalyzeRequest) (*pb.AnalyzeResponse, error) {
+    wace.InitTransaction(req.TransactionId)
+
+    payload := pluginmanager.HTTPPayload{
+        URI:         req.Uri,
+        Method:      req.Method,
+        HTTPVersion: req.HttpVersion,
+        RequestHeaders: protoHeadersToWACE(req.Headers),
+        RequestBody:    req.Body,
+    }
+    _ = wace.Analyze(req.PayloadType, req.TransactionId, payload, req.ModelIds)
+
+    wafParams := make(map[string]string)
+    for k, v := range req.WafParams {
+        wafParams[k] = v
+    }
+
+    blocked, err := wace.CheckTransaction(req.TransactionId, req.DecisionPlugin, wafParams)
+    if err != nil {
+        return nil, err
+    }
+
+    // Note: for ModSecurity multi-phase use, only call CloseTransaction at the
+    // end of the last phase, not after every AnalyzePhase call.
+    if req.IsFinalPhase {
+        wace.CloseTransaction(req.TransactionId)
+    }
+
+    return &pb.AnalyzeResponse{Block: blocked}, nil
+}
+```
+
+<Note>
+The decision plugin is solely responsible for interpreting `wafParams`. WACElib's core passes the map through unchanged via `DecisionInput.WAFdata`. If your decision plugin does not use CRS scores (for example, a pure ML-based plugin), you can safely pass an empty map: `make(map[string]string)`.
+</Note>
+
+<Tip>
+The `metric.Meter` passed to `Init` enables OpenTelemetry instrumentation. WACElib records two metrics out of the box: `wace.model.duration.nanoseconds` (a histogram per model execution) and `wace.client.request.blocked.total` (a counter per blocked request). Pass a real `metric.Meter` from your application's OpenTelemetry provider to export these to your observability backend. In tests and development, use `metric.NewMeterProvider().Meter("your-app")` from `go.opentelemetry.io/otel/sdk/metric`.
+</Tip>

@@ -1,0 +1,228 @@
+---
+title: "pluginmanager package: HTTPPayload, ModelResults types"
+description: "Public data types shared between WACElib core and plugins — HTTPPayload, HTTPHeader, ModelInput, ModelResults, DecisionInput, and ModelStatus structs."
+---
+
+The `pluginmanager` package defines the data types that flow between the WACElib core and the loaded `.so` plugins. These structs are used both as function arguments when calling plugin entry points and as message payloads when routing traffic through NATS for async or remote-sync execution. You will use these types when constructing payloads to pass to `wace.Analyze` and when implementing plugin interfaces.
+
+---
+
+## HTTPHeader
+
+A single HTTP header key-value pair.
+
+```go
+type HTTPHeader struct {
+    Key   string
+    Value string
+}
+```
+
+<ResponseField name="Key" type="string" required>
+  Header name, e.g. `"Content-Type"` or `"User-Agent"`.
+</ResponseField>
+
+<ResponseField name="Value" type="string" required>
+  Header value, e.g. `"application/json"`.
+</ResponseField>
+
+---
+
+## HTTPPayload
+
+Represents the full HTTP transaction data available at a given processing phase. Populate only the fields that are available for the current phase; unused fields remain at their zero values.
+
+```go
+type HTTPPayload struct {
+    URI              string
+    Method           string
+    HTTPVersion      string
+    RequestHeaders   []HTTPHeader
+    RequestBody      string
+    ResponseProtocol string
+    ResponseCode     int
+    ResponseHeaders  []HTTPHeader
+    ResponseBody     string
+}
+```
+
+<ResponseField name="URI" type="string">
+  Request URI, e.g. `"/cgi-bin/process.cgi"`.
+</ResponseField>
+
+<ResponseField name="Method" type="string">
+  HTTP request method, e.g. `"GET"` or `"POST"`.
+</ResponseField>
+
+<ResponseField name="HTTPVersion" type="string">
+  HTTP version string, e.g. `"HTTP/1.1"`.
+</ResponseField>
+
+<ResponseField name="RequestHeaders" type="[]HTTPHeader">
+  Slice of request header key-value pairs.
+</ResponseField>
+
+<ResponseField name="RequestBody" type="string">
+  Raw request body as a string.
+</ResponseField>
+
+<ResponseField name="ResponseProtocol" type="string">
+  HTTP response protocol string, e.g. `"HTTP/1.1"`.
+</ResponseField>
+
+<ResponseField name="ResponseCode" type="int">
+  HTTP response status code, e.g. `200` or `404`.
+</ResponseField>
+
+<ResponseField name="ResponseHeaders" type="[]HTTPHeader">
+  Slice of response header key-value pairs.
+</ResponseField>
+
+<ResponseField name="ResponseBody" type="string">
+  Raw response body as a string.
+</ResponseField>
+
+### Example construction
+
+```go
+payload := pluginmanager.HTTPPayload{
+    URI:         "/api/v1/users",
+    Method:      "POST",
+    HTTPVersion: "HTTP/1.1",
+    RequestHeaders: []pluginmanager.HTTPHeader{
+        {Key: "User-Agent",   Value: "Mozilla/4.0 (compatible; MSIE5.01; Windows NT)"},
+        {Key: "Host",         Value: "www.example.com"},
+        {Key: "Content-Type", Value: "application/x-www-form-urlencoded"},
+        {Key: "Connection",   Value: "Keep-Alive"},
+    },
+    RequestBody: "licenseID=string&content=string",
+}
+
+// Response-phase payload
+responsePayload := pluginmanager.HTTPPayload{
+    ResponseProtocol: "HTTP/1.1",
+    ResponseCode:     200,
+    ResponseHeaders: []pluginmanager.HTTPHeader{
+        {Key: "Content-Type",   Value: "text/html"},
+        {Key: "Content-Length", Value: "88"},
+    },
+    ResponseBody: "<html><body><h1>Hello</h1></body></html>",
+}
+```
+
+---
+
+## ModelInput
+
+The struct passed to a model plugin's `Process` function and serialised as a NATS message payload for async and remote-sync plugins.
+
+```go
+type ModelInput struct {
+    TransactionId string      `json:"transactionId"`
+    Payload       HTTPPayload `json:"payload"`
+}
+```
+
+<ResponseField name="TransactionId" type="string" required>
+  The identifier of the transaction being scored.
+</ResponseField>
+
+<ResponseField name="Payload" type="HTTPPayload" required>
+  The HTTP data to be analysed.
+</ResponseField>
+
+---
+
+## ModelResults
+
+The struct returned by a model plugin's `Process` function and stored per-model in the transaction results map.
+
+```go
+type ModelResults struct {
+    ProbAttack float64                `json:"probattack"`
+    Data       map[string]interface{} `json:"data"`
+}
+```
+
+<ResponseField name="ProbAttack" type="float64" required>
+  Probability that the transaction represents an attack. Expected range is
+  `[0.0, 1.0]`, where `1.0` indicates the highest certainty of malicious
+  intent.
+</ResponseField>
+
+<ResponseField name="Data" type="map[string]interface{}">
+  Optional additional metadata produced by the model, such as feature
+  importance scores or raw logits. The decision plugin receives this map as
+  part of `DecisionInput.Results`.
+</ResponseField>
+
+---
+
+## DecisionInput
+
+The struct passed to a decision plugin's `CheckResults` function. Assembled by the `PluginManager` from all model results collected for the transaction.
+
+```go
+type DecisionInput struct {
+    TransactionId string
+    Results       map[string]ModelResults
+    ModelWeight   map[string]float64
+    WAFdata       map[string]string
+}
+```
+
+<ResponseField name="TransactionId" type="string" required>
+  The identifier of the transaction being evaluated.
+</ResponseField>
+
+<ResponseField name="Results" type="map[string]ModelResults" required>
+  Map from model plugin ID to that plugin's `ModelResults` for this
+  transaction. Contains one entry per model that completed successfully.
+</ResponseField>
+
+<ResponseField name="ModelWeight" type="map[string]float64" required>
+  Map from model plugin ID to the weight declared in the configuration. Mirrors
+  the keys of `Results`; used by the decision plugin when combining scores.
+</ResponseField>
+
+<ResponseField name="WAFdata" type="map[string]string" required>
+  Key-value pairs from the WAF engine, forwarded unchanged from the
+  `wafParams` argument of `wace.CheckTransaction`. Typically contains ModSecurity
+  anomaly score keys such as `COMBINED_SCORE`, `inbound_blocking`, and
+  `inbound_threshold`.
+</ResponseField>
+
+---
+
+## ModelStatus
+
+An internal status struct used by the `PluginManager` to communicate the outcome of a single plugin execution back to the coordinating goroutine via a channel.
+
+```go
+type ModelStatus struct {
+    ModelID    string
+    ProbAttack float64
+    Err        error
+}
+```
+
+<ResponseField name="ModelID" type="string">
+  ID of the model plugin that produced this status.
+</ResponseField>
+
+<ResponseField name="ProbAttack" type="float64">
+  The `ProbAttack` value from the model's `ModelResults`. Zero when `Err` is
+  non-nil.
+</ResponseField>
+
+<ResponseField name="Err" type="error">
+  Non-nil if the plugin failed to process the input. A non-nil error does not
+  abort the transaction; WACElib logs the error and continues waiting for other
+  plugins.
+</ResponseField>
+
+<Note>
+  `ModelStatus` is used internally by the `PluginManager` and is not part of
+  the plugin interface contract. Plugin authors receive and return `ModelInput`
+  and `ModelResults` only.
+</Note>

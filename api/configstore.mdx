@@ -1,0 +1,231 @@
+---
+title: "configstore package: ConfigFileData and ConfigStore API"
+description: "Singleton config store for WACElib — parse YAML into ConfigFileData, create or retrieve the ConfigStore, and inspect plugin metadata at runtime."
+---
+
+The `configstore` package is responsible for loading, validating, and exposing WACElib's runtime configuration. It enforces a singleton pattern: only one `ConfigStore` may exist per process. The package also defines the `ModelPluginType` enum that controls which portion of an HTTP transaction each model plugin is allowed to process.
+
+## ConfigFileData
+
+`ConfigFileData` is the struct that YAML configuration files unmarshal into. Pass an instance to `wace.Init` after unmarshalling.
+
+```go
+type ConfigFileData struct {
+    Logpath         string
+    Loglevel        string
+    Modelplugins    []configFileModelPlugin
+    Decisionplugins []configFileDecisionPlugin
+    NatsURL         string
+}
+```
+
+<ResponseField name="Logpath" type="string" required>
+  Filesystem path for the WACElib log file. The path must be writable; if the
+  file does not exist, WACElib attempts to create it during `Init`.
+</ResponseField>
+
+<ResponseField name="Loglevel" type="string" required>
+  Log verbosity. Valid values: `"DEBUG"`, `"INFO"`, `"WARN"`, `"ERROR"`.
+</ResponseField>
+
+<ResponseField name="Modelplugins" type="[]configFileModelPlugin">
+  Ordered list of model plugin configurations. Each entry identifies a `.so`
+  plugin file, its type, weight, execution mode, and optional custom parameters.
+
+  <Expandable title="configFileModelPlugin fields">
+    <ResponseField name="ID" type="string" required>Plugin identifier used in `Analyze` calls.</ResponseField>
+    <ResponseField name="Path" type="string" required>Absolute or relative path to the compiled `.so` file.</ResponseField>
+    <ResponseField name="Weight" type="float64">Relative weight passed to the decision plugin when combining scores. Defaults to `0`.</ResponseField>
+    <ResponseField name="Threshold" type="float64">Optional per-plugin probability threshold. Interpretation is up to the decision plugin.</ResponseField>
+    <ResponseField name="Params" type="map[string]string">Arbitrary key-value pairs forwarded to the plugin's `InitPlugin` / `InitPluginAsync` function.</ResponseField>
+    <ResponseField name="PluginType" type="string" required>String representation of `ModelPluginType` (e.g. `"RequestHeaders"`, `"Everything"`).</ResponseField>
+    <ResponseField name="Mode" type="string">Execution mode: `"sync"` (default) or `"async"`. Async plugins communicate via NATS.</ResponseField>
+    <ResponseField name="Remote" type="bool">When `true`, the sync plugin runs in a remote process and communicates over NATS.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="Decisionplugins" type="[]configFileDecisionPlugin">
+  List of decision plugin configurations.
+
+  <Expandable title="configFileDecisionPlugin fields">
+    <ResponseField name="ID" type="string" required>Plugin identifier used in `CheckTransaction` calls.</ResponseField>
+    <ResponseField name="Path" type="string" required>Absolute or relative path to the compiled `.so` file.</ResponseField>
+    <ResponseField name="Params" type="map[string]string">Arbitrary key-value pairs forwarded to the plugin's `InitPlugin` function.</ResponseField>
+    <ResponseField name="wafweight" type="float64">YAML-only field (unexported in Go). Weight given to WAF signals relative to ML model outputs. Interpretation is defined by the plugin.</ResponseField>
+    <ResponseField name="decisionbalance" type="float64">YAML-only field (unexported in Go). Balance factor between WAF and ML signals. Interpretation is defined by the plugin.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="NatsURL" type="string">
+  NATS server address used for async and remote-sync plugins. Defaults to
+  `"localhost:4222"` when not set.
+</ResponseField>
+
+### YAML-to-Go mapping example
+
+```yaml
+logpath: "/var/log/wace.log"
+loglevel: "INFO"
+natsurl: "nats://nats.internal:4222"
+
+modelplugins:
+  - id: "request-header-model"
+    path: "/usr/lib/wace/plugins/header_model.so"
+    plugintype: "RequestHeaders"
+    weight: 1.0
+    mode: sync
+    params:
+      threshold: "0.75"
+
+decisionplugins:
+  - id: "simple"
+    path: "/usr/lib/wace/plugins/simple_decision.so"
+    params:
+      decision_balance: "0.5"
+```
+
+```go
+var conf configstore.ConfigFileData
+yaml.Unmarshal(raw, &conf)
+// conf.Logpath         == "/var/log/wace.log"
+// conf.Loglevel        == "INFO"
+// conf.NatsURL         == "nats://nats.internal:4222"
+// conf.Modelplugins[0].ID == "request-header-model"
+```
+
+---
+
+## ConfigStore
+
+`ConfigStore` is the runtime representation of the configuration after parsing and validation. Retrieve the singleton with `configstore.Get()`.
+
+```go
+type ConfigStore struct {
+    ModelPlugins    map[string]modelPluginConfig
+    DecisionPlugins map[string]decisionPluginConfig
+    LogPath         string
+    LogLevel        logging.LogLevel
+    NatsURL         string
+    ApplicationId   string
+}
+```
+
+<ResponseField name="ModelPlugins" type="map[string]modelPluginConfig">
+  Map from model plugin ID to its validated runtime configuration. Populated by
+  `SetConfig`; keyed by `configFileModelPlugin.ID`.
+</ResponseField>
+
+<ResponseField name="DecisionPlugins" type="map[string]decisionPluginConfig">
+  Map from decision plugin ID to its validated runtime configuration.
+</ResponseField>
+
+<ResponseField name="LogPath" type="string">
+  Validated log file path resolved from `ConfigFileData.Logpath`.
+</ResponseField>
+
+<ResponseField name="LogLevel" type="logging.LogLevel">
+  Parsed log level value converted from the `Loglevel` string.
+</ResponseField>
+
+<ResponseField name="NatsURL" type="string">
+  NATS server URL. Set to `"localhost:4222"` if `ConfigFileData.NatsURL` was
+  empty.
+</ResponseField>
+
+<ResponseField name="ApplicationId" type="string">
+  Optional application identifier. Not set by `SetConfig`; reserved for
+  runtime assignment.
+</ResponseField>
+
+---
+
+## Functions
+
+### New
+
+```go
+func New() (*ConfigStore, error)
+```
+
+Creates and returns the singleton `ConfigStore`. Returns an error if a singleton already exists (`"ConfigStore: an instance already exists"`). Called internally by `wace.Init`; you do not need to call it directly under normal usage.
+
+### Get
+
+```go
+func Get() (*ConfigStore, error)
+```
+
+Returns the existing singleton `ConfigStore`. Returns an error if `New` has not been called yet (`"ConfigStore: Configuration was not loaded"`). Safe to call from multiple goroutines after `wace.Init` completes.
+
+### Clean
+
+```go
+func Clean()
+```
+
+Resets the singleton reference to `nil`, allowing a subsequent `New()` call to succeed. Intended for use in tests to prevent state leaking between test cases.
+
+```go
+func TestSomething(t *testing.T) {
+    defer configstore.Clean()
+    // ... test code that calls wace.Init
+}
+```
+
+### IsAsync
+
+```go
+func (c *ConfigStore) IsAsync(modelID string) bool
+```
+
+Returns `true` if the model plugin identified by `modelID` is configured with `Mode == "async"`. Used internally by `wace.Analyze` to route plugin calls through NATS rather than direct function calls.
+
+<ParamField path="modelID" type="string" required>
+  A model plugin ID that exists in `ConfigStore.ModelPlugins`.
+</ParamField>
+
+---
+
+## ModelPluginType
+
+`ModelPluginType` is an integer enum that describes which part of an HTTP transaction a model plugin is designed to analyse. It is used as the `modelsTypeAsString` parameter of `wace.Analyze` (via its string representation) and as the `PluginType` field in plugin configuration.
+
+```go
+type ModelPluginType int
+
+const (
+    RequestHeaders  ModelPluginType = iota // 0
+    RequestBody                            // 1
+    AllRequest                             // 2
+    ResponseHeaders                        // 3
+    ResponseBody                           // 4
+    AllResponse                            // 5
+    Everything                             // 6
+)
+```
+
+| Constant | String | Description |
+|---|---|---|
+| `RequestHeaders` | `"RequestHeaders"` | HTTP request headers only |
+| `RequestBody` | `"RequestBody"` | HTTP request body only |
+| `AllRequest` | `"AllRequest"` | Full HTTP request (headers + body) |
+| `ResponseHeaders` | `"ResponseHeaders"` | HTTP response headers only |
+| `ResponseBody` | `"ResponseBody"` | HTTP response body only |
+| `AllResponse` | `"AllResponse"` | Full HTTP response (headers + body) |
+| `Everything` | `"Everything"` | Any portion of request or response |
+
+### StringToPluginType
+
+```go
+func StringToPluginType(textType string) (ModelPluginType, error)
+```
+
+Converts the string representation back to a `ModelPluginType` constant. Returns an error for unrecognised strings.
+
+```go
+t, err := configstore.StringToPluginType("AllRequest")
+// t == configstore.AllRequest, err == nil
+
+t, err = configstore.StringToPluginType("invalid")
+// t == -1, err != nil
+```

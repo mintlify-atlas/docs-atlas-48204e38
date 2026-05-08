@@ -1,0 +1,207 @@
+---
+title: "WACElib transaction lifecycle: Init to CloseTransaction"
+description: "Learn how WACElib models each HTTP request as a transaction, and how to correctly sequence InitTransaction, Analyze, CheckTransaction, and CloseTransaction."
+---
+
+In WACElib, a **transaction** represents one complete HTTP request/response cycle. Every request your WAF inspects is given a unique identifier and passes through a fixed sequence of operations: the library initializes tracking state, invokes ML model plugins over one or more payload segments, waits for all synchronous results, runs a decision plugin, and finally releases all resources. Understanding this lifecycle is essential to integrating WACElib correctly — calling operations out of order or skipping cleanup causes resource leaks and undefined behavior.
+
+## Operation order
+
+The four core functions must be called in strict order for every request:
+
+<Steps>
+  <Step title="Init (once at process startup)">
+    Call `Init` once when your application starts. It initializes the global `ConfigStore`, loads all model and decision plugins from the configuration, establishes the NATS connection, and wires up OpenTelemetry metrics.
+
+    ```go
+    import (
+        wace "github.com/tilsor/ModSecIntl_wace_lib"
+        "github.com/tilsor/ModSecIntl_wace_lib/configstore"
+        "go.opentelemetry.io/otel/metric"
+    )
+
+    func startWACE(met metric.Meter, conf configstore.ConfigFileData) error {
+        return wace.Init(met, conf)
+    }
+    ```
+
+    `Init` must not be called more than once per process. It creates the singleton `ConfigStore` and returns an error if one already exists.
+  </Step>
+
+  <Step title="InitTransaction (once per request)">
+    Call `InitTransaction` with a unique identifier before any analysis begins. Internally, this stores a `transactionSync` entry in the global `analysisMap` (a `sync.Map`) with a zeroed counter and a fresh unbuffered channel. It also calls `plugins.InitTransaction`, which allocates a `sync.Map` inside `PluginManager.results` to accumulate model outputs for this transaction.
+
+    ```go
+    transactionID := generateUniqueID() // e.g. a random hex string
+    wace.InitTransaction(transactionID)
+    ```
+
+    The transaction ID must be unique across all concurrent in-flight requests.
+  </Step>
+
+  <Step title="Analyze (one or more times)">
+    Call `Analyze` for each payload segment you want scored. You pass the plugin type as a string (matching a `configstore.ModelPluginType`), the transaction ID, an `pluginmanager.HTTPPayload`, and a slice of model plugin IDs to invoke.
+
+    ```go
+    import "github.com/tilsor/ModSecIntl_wace_lib/pluginmanager"
+
+    requestHeadersPayload := pluginmanager.HTTPPayload{
+        URI:         "/api/v1/resource",
+        Method:      "POST",
+        HTTPVersion: "HTTP/1.1",
+        RequestHeaders: []pluginmanager.HTTPHeader{
+            {Key: "Content-Type", Value: "application/json"},
+            {Key: "User-Agent",   Value: "curl/7.88.1"},
+        },
+    }
+
+    err := wace.Analyze("RequestHeaders", transactionID, requestHeadersPayload, []string{"headersModel"})
+    ```
+
+    Each `Analyze` call atomically increments the `transactionSync.Counter` for this transaction, then launches `callPlugins` in a goroutine. You may call `Analyze` multiple times with different plugin types before calling `CheckTransaction`.
+
+    ```go
+    // Score both the headers and the body before making a decision
+    _ = wace.Analyze("RequestHeaders", transactionID, requestHeadersPayload, []string{"headersModel"})
+    _ = wace.Analyze("RequestBody",    transactionID, bodyPayload,           []string{"bodyModel"})
+    ```
+
+    Valid `modelsTypeAsString` values map directly to `configstore.ModelPluginType`:
+
+    | String value        | Meaning                              |
+    | ------------------- | ------------------------------------ |
+    | `"RequestHeaders"`  | Request line and headers only        |
+    | `"RequestBody"`     | Request body only                    |
+    | `"AllRequest"`      | Full request (headers + body)        |
+    | `"ResponseHeaders"` | Response status line and headers     |
+    | `"ResponseBody"`    | Response body only                   |
+    | `"AllResponse"`     | Full response (headers + body)       |
+    | `"Everything"`      | Entire request and response          |
+  </Step>
+
+  <Step title="CheckTransaction (after each batch of Analyze calls)">
+    Call `CheckTransaction` to wait for all pending model goroutines to complete and then invoke the decision plugin. It reads the `transactionSync.Counter` set by `Analyze`, drains exactly that many messages from the channel, resets the counter to zero, then calls `plugins.CheckResult` which feeds accumulated `ModelResults` into the decision plugin's `CheckResults` function.
+
+    ```go
+    blocked, err := wace.CheckTransaction(transactionID, "simple", wafParams)
+    if err != nil {
+        // handle error
+    }
+    if blocked {
+        // reject the request
+    }
+    ```
+
+    `CheckTransaction` returns `(bool, error)`. The boolean is `true` when the decision plugin determines the request should be blocked.
+
+    Because `CheckTransaction` resets the counter to zero after draining, you can call it again after more `Analyze` calls — for example, after inspecting request headers in phase 1, then the response body in phase 2.
+  </Step>
+
+  <Step title="CloseTransaction (once, after all checks)">
+    Call `CloseTransaction` when request processing is fully complete. It closes the sync channel, drains it, deletes the entry from `analysisMap`, and calls `plugins.CloseTransaction` which closes all per-type model-status channels and deletes the results map entry.
+
+    ```go
+    wace.CloseTransaction(transactionID)
+    ```
+  </Step>
+</Steps>
+
+## Complete example
+
+The following example mirrors the `TestAnalyzeRequestInParts` test and shows a full transaction that analyzes request headers and body separately before making a single decision:
+
+```go
+package main
+
+import (
+    "fmt"
+    "math/rand"
+
+    wace "github.com/tilsor/ModSecIntl_wace_lib"
+    "github.com/tilsor/ModSecIntl_wace_lib/pluginmanager"
+)
+
+func generateRandomID() string {
+    letters := "1234567890ABCDEF"
+    id := ""
+    for i := 0; i < 16; i++ {
+        id += string(letters[rand.Intn(len(letters))])
+    }
+    return id
+}
+
+func handleRequest() error {
+    transactionID := generateRandomID()
+
+    // 1. Begin transaction
+    wace.InitTransaction(transactionID)
+
+    // 2a. Score request headers
+    requestHeadersPayload := pluginmanager.HTTPPayload{
+        URI:         "/cgi-bin/process.cgi",
+        Method:      "POST",
+        HTTPVersion: "HTTP/1.1",
+        RequestHeaders: []pluginmanager.HTTPHeader{
+            {Key: "User-Agent", Value: "Mozilla/4.0"},
+            {Key: "Content-Type", Value: "application/x-www-form-urlencoded"},
+        },
+    }
+    if err := wace.Analyze("RequestHeaders", transactionID, requestHeadersPayload, []string{"trivialRequestHeaders"}); err != nil {
+        return err
+    }
+
+    // 2b. Score request body
+    bodyPayload := pluginmanager.HTTPPayload{
+        RequestBody: "licenseID=string&content=string&/paramsXML=string",
+    }
+    if err := wace.Analyze("RequestBody", transactionID, bodyPayload, []string{"trivialRequestBody"}); err != nil {
+        return err
+    }
+
+    // 3. Wait for models and get decision
+    blocked, err := wace.CheckTransaction(transactionID, "simple", make(map[string]string))
+    if err != nil {
+        return fmt.Errorf("check transaction: %w", err)
+    }
+
+    // 4. Always release resources
+    wace.CloseTransaction(transactionID)
+
+    if blocked {
+        return fmt.Errorf("request blocked by WAF")
+    }
+    return nil
+}
+```
+
+## Multiple CheckTransaction calls
+
+WACElib is designed to work with WAFs that process requests in phases. You can interleave `Analyze` and `CheckTransaction` calls within the same transaction — for example, checking headers in phase 1 and deciding whether to continue to phase 2 before analyzing the response:
+
+```go
+wace.InitTransaction(transactionID)
+
+// Phase 1: analyze request headers
+_ = wace.Analyze("RequestHeaders", transactionID, requestHeadersPayload, []string{"headersModel"})
+blocked, err := wace.CheckTransaction(transactionID, "simple", phase1WafParams)
+if blocked {
+    wace.CloseTransaction(transactionID)
+    return // reject early
+}
+
+// Phase 2: analyze response body
+_ = wace.Analyze("ResponseBody", transactionID, responseBodyPayload, []string{"responseModel"})
+blocked, err = wace.CheckTransaction(transactionID, "simple", phase2WafParams)
+
+wace.CloseTransaction(transactionID)
+```
+
+`CheckTransaction` resets the internal counter after each call, so the next batch of `Analyze` calls starts a fresh count.
+
+<Note>
+All transaction state in WACElib is stored in `sync.Map` instances (`analysisMap` in the core package and `PluginManager.results`). This means concurrent calls across different transaction IDs are safe without external locking. However, all calls for a **single** transaction ID must be serialized by the caller — do not call `Analyze` and `CheckTransaction` concurrently on the same ID.
+</Note>
+
+<Warning>
+Always call `CloseTransaction` after you are done with a transaction, even if `CheckTransaction` returns an error. Failing to do so leaks the sync channel allocated by `InitTransaction`, the results map entry in `PluginManager`, and all associated per-type model channels. These leaks accumulate for every unfinished request.
+</Warning>

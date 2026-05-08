@@ -1,0 +1,170 @@
+---
+title: "Analyze and CheckTransaction — run ML models and decide"
+description: "Submit HTTP payload slices to model plugins with Analyze, then invoke a decision plugin with CheckTransaction to get a block or allow verdict."
+---
+
+`Analyze` fans out an HTTP payload to one or more model plugins of a given type, running them concurrently in the background. `CheckTransaction` blocks until every outstanding `Analyze` call for the transaction has completed, then invokes a decision plugin to produce a final allow/block verdict. The two functions work together: you may call `Analyze` multiple times (once per payload phase) before calling `CheckTransaction` once at the end.
+
+## Analyze
+
+### Signature
+
+```go
+func Analyze(modelsTypeAsString, transactionId string, payload pluginmanager.HTTPPayload, models []string) error
+```
+
+### Parameters
+
+<ParamField path="modelsTypeAsString" type="string" required>
+  The string representation of the `configstore.ModelPluginType` that matches
+  the payload being submitted. Only plugins configured with the matching type
+  are invoked. Must be one of:
+
+  | Value | Matches |
+  |---|---|
+  | `"RequestHeaders"` | HTTP request headers |
+  | `"RequestBody"` | HTTP request body |
+  | `"AllRequest"` | Full request (headers + body) |
+  | `"ResponseHeaders"` | HTTP response headers |
+  | `"ResponseBody"` | HTTP response body |
+  | `"AllResponse"` | Full response (headers + body) |
+  | `"Everything"` | Any part of request or response |
+
+  Passing an unrecognised string returns an error immediately without calling any plugins.
+</ParamField>
+
+<ParamField path="transactionId" type="string" required>
+  The transaction identifier previously registered with `InitTransaction`.
+</ParamField>
+
+<ParamField path="payload" type="pluginmanager.HTTPPayload" required>
+  The HTTP data to be scored. Populate only the fields relevant to
+  `modelsTypeAsString`; unused fields can remain at their zero values. See the
+  [pluginmanager reference](/api/pluginmanager) for the full struct definition.
+</ParamField>
+
+<ParamField path="models" type="[]string" required>
+  Slice of model plugin IDs (as declared in the configuration) to invoke for
+  this payload. If the slice is empty, `Analyze` returns `nil` immediately
+  without incrementing the internal counter, so `CheckTransaction` will not
+  wait for this call.
+</ParamField>
+
+### Return value
+
+Returns `nil` if the payload was dispatched successfully or `models` was empty. Returns an error if `modelsTypeAsString` is not a valid `ModelPluginType` string. Plugin-level failures (unknown plugin ID, type mismatch) are logged as errors but do not surface as return values from `Analyze` — they appear as error entries in `ModelStatus` and are logged.
+
+---
+
+## CheckTransaction
+
+### Signature
+
+```go
+func CheckTransaction(transactionID, decisionPlugin string, wafParams map[string]string) (bool, error)
+```
+
+### Parameters
+
+<ParamField path="transactionID" type="string" required>
+  The transaction identifier previously registered with `InitTransaction`.
+</ParamField>
+
+<ParamField path="decisionPlugin" type="string" required>
+  The ID of the decision plugin to invoke, as declared in the configuration.
+  The plugin receives all model results collected so far for this transaction.
+</ParamField>
+
+<ParamField path="wafParams" type="map[string]string" required>
+  Key-value pairs from the WAF engine passed through to the decision plugin as
+  `DecisionInput.WAFdata`. Pass an empty map if no WAF scores are available.
+  Typical keys used by the built-in `simple` decision plugin include:
+
+  ```
+  COMBINED_SCORE, HTTP, LFI, PHPI, RCE, RFI, SESS, SQLI, XSS,
+  inbound_blocking, inbound_detection, inbound_per_pl, inbound_threshold,
+  outbound_blocking, outbound_detection, outbound_per_pl, outbound_threshold,
+  phase
+  ```
+</ParamField>
+
+### Return values
+
+| Value | Description |
+|---|---|
+| `bool` | `true` if the decision plugin determined the transaction should be blocked; `false` to allow. |
+| `error` | Non-nil if the transaction ID does not exist in the analysis map, the decision plugin is not found, or the results store has no entry for this transaction. |
+
+When the return is `true` (blocked), WACElib increments the `wace.client.request.blocked.total` OpenTelemetry counter attributed with the decision plugin name.
+
+---
+
+## Usage examples
+
+### Analyzing request headers only
+
+```go
+wace.InitTransaction(txID)
+defer wace.CloseTransaction(txID)
+
+payload := pluginmanager.HTTPPayload{
+    URI:         "/api/login",
+    Method:      "POST",
+    HTTPVersion: "HTTP/1.1",
+    RequestHeaders: []pluginmanager.HTTPHeader{
+        {Key: "Content-Type", Value: "application/json"},
+        {Key: "User-Agent",   Value: "Mozilla/5.0"},
+    },
+}
+
+if err := wace.Analyze("RequestHeaders", txID, payload, []string{"header-model"}); err != nil {
+    return err
+}
+
+blocked, err := wace.CheckTransaction(txID, "simple", map[string]string{})
+```
+
+### Analyzing request and response in phases
+
+```go
+wace.InitTransaction(txID)
+defer wace.CloseTransaction(txID)
+
+// Phase 1 — request headers arrive
+wace.Analyze("RequestHeaders", txID, reqHeaderPayload, []string{"trivialRequestHeaders"})
+
+// Phase 2 — request body arrives
+wace.Analyze("RequestBody", txID, reqBodyPayload, []string{"trivialRequestBody"})
+
+// All Analyze calls are dispatched; now wait and decide
+blocked, err := wace.CheckTransaction(txID, "simple", wafParams)
+```
+
+### Full WAF params from test suite
+
+```go
+wafParams := map[string]string{
+    "COMBINED_SCORE":    "0",
+    "inbound_blocking":  "20",
+    "inbound_threshold": "5",
+    "outbound_blocking": "0",
+    "outbound_threshold": "4",
+    "phase":             "2",
+    // ... other ModSecurity anomaly score keys
+}
+
+blocked, err := wace.CheckTransaction(txID, "simple", wafParams)
+```
+
+<Note>
+  `CheckTransaction` blocks the calling goroutine until every pending `Analyze`
+  goroutine for `transactionID` sends a completion signal. If you called
+  `Analyze` three times, `CheckTransaction` waits for three completion signals
+  before invoking the decision plugin.
+</Note>
+
+<Warning>
+  Calling `CheckTransaction` for a transaction ID that was never registered with
+  `InitTransaction` returns an error immediately. Always call `InitTransaction`
+  first.
+</Warning>

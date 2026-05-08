@@ -1,0 +1,51 @@
+---
+title: "WACElib: ML-assisted web application firewall library"
+description: "WACElib is a Go library that combines OWASP Core Rule Set WAF signals with machine learning model plugins to detect web attacks with fewer false positives."
+---
+
+WACElib (WAF with Adaptive Classification Engine library) is a Go library that augments traditional rule-based web application firewall analysis with machine learning inference. Instead of relying exclusively on WAF anomaly scores to decide whether to block a request, WACElib routes HTTP transaction data through configurable ML model plugins, collects their probability-of-attack scores, and then combines those scores with conventional WAF signals through a decision plugin. The result is a more nuanced block/allow decision that can be tuned per deployment to reduce false positives without sacrificing detection coverage.
+
+## What WACElib does
+
+A typical WAF like ModSecurity or Coraza evaluates each HTTP transaction against the OWASP Core Rule Set (CRS) and produces an anomaly score. If the score exceeds a configured threshold, the request is blocked. This approach is reliable but blunt: benign traffic with unusual payloads can trigger rule matches and inflate the anomaly score well above the threshold.
+
+WACElib adds a second opinion. After CRS evaluation, you pass the transaction data and the WAF anomaly scores into WACElib. WACElib fans out the HTTP payload to one or more ML model plugins, each trained to recognize attack patterns for a specific part of the transaction (request headers, request body, response, or the full transaction). When all models finish, a decision plugin combines their attack probability scores with the WAF anomaly scores and returns a single boolean: block or allow.
+
+## Design philosophy
+
+WACElib is intentionally small and composable. It manages three concerns:
+
+- **Transaction lifecycle** — initializing, tracking, and cleaning up per-request state across concurrent model calls.
+- **Plugin dispatch** — routing payloads to the right model plugins based on the `ModelPluginType` of each analysis phase, supporting both synchronous (in-process) and asynchronous (NATS-based) execution.
+- **Decision aggregation** — waiting for all analysis to complete, then delegating the final block/allow verdict to a pluggable decision function.
+
+The library does not implement models itself. It defines the interfaces that model plugins and decision plugins must expose, and it handles all the concurrency and coordination plumbing so that plugin authors can focus on inference logic.
+
+## Key capabilities
+
+- **Concurrent model execution** — model plugins run in separate goroutines. `CheckTransaction` blocks until every dispatched model has reported a result, then calls the decision plugin.
+- **Sync and async modes** — synchronous plugins return results inline; asynchronous plugins publish results over NATS, allowing models to run on remote processes or separate machines.
+- **Phased analysis** — you can call `Analyze` multiple times per transaction (for example, once for request headers and once for the request body), each time targeting a different set of plugins scoped to that `ModelPluginType`.
+- **OpenTelemetry metrics** — model latency histograms and blocked-request counters are emitted through the `metric.Meter` you provide at initialization.
+- **YAML configuration** — model and decision plugins, their weights, thresholds, execution mode, and NATS connectivity are all declared in a `ConfigFileData` struct that maps directly from a YAML file.
+
+<Note>
+  WACElib functions must be called in a strict order for each transaction: `Init` once at startup, then for every request: `InitTransaction` → one or more `Analyze` calls → `CheckTransaction` → `CloseTransaction`. Calling `CheckTransaction` before all intended `Analyze` calls are dispatched, or omitting `CloseTransaction`, will leave internal state and channel leaks.
+</Note>
+
+## Explore the documentation
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Add WACElib to a Go project and run your first transaction lifecycle in minutes.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how WAF signals, ML model plugins, and decision plugins fit together.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration/overview">
+    Learn how to declare model plugins, decision plugins, log paths, and NATS settings in YAML.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/init">
+    Full reference for `Init`, `InitTransaction`, `Analyze`, `CheckTransaction`, and `CloseTransaction`.
+  </Card>
+</CardGroup>

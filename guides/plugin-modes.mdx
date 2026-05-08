@@ -1,0 +1,148 @@
+---
+title: "WACElib plugin modes: sync local, sync remote, async"
+description: "Understand sync local, sync remote, and async model plugin modes — and how to configure each one for the right latency and reliability trade-off."
+---
+
+WACElib supports three execution modes for model plugins, each with different latency, network, and reliability characteristics. Choosing the right mode depends on whether your model runs in-process alongside WACElib, whether it runs as a remote service reachable over NATS, and whether its result needs to influence the blocking decision for the current request. All three modes are configured per plugin in your YAML configuration and are loaded at startup by `Init`.
+
+## How modes are selected
+
+When `Init` loads a plugin, it reads two fields from each entry in `modelplugins`:
+
+- `mode` — either `"sync"` or `"async"`
+- `remote` — `true` or `false` (default `false`)
+
+The combination determines the execution path taken in `callPlugins`:
+
+| `mode`   | `remote` | Execution path                                         |
+| -------- | -------- | ------------------------------------------------------ |
+| `sync`   | `false`  | `plugins.Process()` called directly in a goroutine     |
+| `sync`   | `true`   | Payload published to NATS; result awaited on channel   |
+| `async`  | `false`  | Payload published to NATS; result not awaited          |
+| `async`  | `true`   | Payload published to NATS; result not awaited          |
+
+## The three modes
+
+<Tabs>
+  <Tab title="Sync local">
+    **Sync local** (`mode: sync`, `remote: false`) is the default in-process execution path. When `callPlugins` encounters a sync, non-remote plugin, it calls `plugins.Process(modelID, transactionID, payload, pluginType, modelPluginStatus)` in a goroutine. `Process` calls the plugin's exported `Process(ModelInput) (ModelResults, error)` function directly, stores the result in the transaction's results map, and sends a `ModelStatus` onto the channel. `CheckTransaction` waits for this status before calling the decision plugin.
+
+    This mode has the lowest latency because there is no serialization or network hop — the model executes in the same process as WACElib.
+
+    **Plugin initialization:** sync local plugins export `InitPlugin(map[string]string, metric.Meter) error` and `Process(ModelInput) (ModelResults, error)`.
+
+    ```yaml
+    modelplugins:
+      - id: "requestHeadersClassifier"
+        plugintype: RequestHeaders
+        path: "/opt/wace/plugins/classifier.so"
+        weight: 0.8
+        mode: sync
+        # remote defaults to false — no NATS required
+        params:
+          threshold: "0.5"
+    ```
+
+    **When to use:** Your ML model is a compiled Go plugin (`.so`) that can run inside the WACElib process, and you need the result to influence the current request's block decision with minimal latency.
+  </Tab>
+
+  <Tab title="Sync remote">
+    **Sync remote** (`mode: sync`, `remote: true`) publishes the payload as JSON to a NATS subject named after the model ID, then waits for a response on `<modelID>/results`. The `ModelResultsHandler` goroutine (started for each remote plugin during `Init`) subscribes to `<modelID>/results`, deserializes the response, stores the result, and forwards a `ModelStatus` onto the sync channel. `CheckTransaction` then waits on this channel exactly as it would for a sync local plugin.
+
+    The payload is a JSON-serialized `ModelInput`:
+
+    ```go
+    type ModelInput struct {
+        TransactionId string      `json:"transactionId"`
+        Payload       HTTPPayload `json:"payload"`
+    }
+    ```
+
+    The remote service must publish back a JSON-serialized `ModelTransmitionResults` to `<modelID>/results`.
+
+    **Plugin initialization:** remote sync plugins export `InitPluginAsync(map[string]string, metric.Meter, func(func(ModelInput) (ModelResults, error))) error` — the callback registers the model's process function with `ModelProcessHandler`.
+
+    ```yaml
+    modelplugins:
+      - id: "deepInspect"
+        plugintype: AllRequest
+        path: "/opt/wace/plugins/deep_inspect.so"
+        weight: 1.0
+        mode: sync
+        remote: true
+        params:
+          url: "nats://inference-host:4222"
+
+    # Top-level NATS connection used by PluginManager
+    natsurl: "nats://nats-server:4222"
+    ```
+
+    **When to use:** Your model is a separate inference service (e.g., a Python process or a GPU-backed server) and you still need its result to block the current request. Expect higher latency than sync local due to network round-trip and JSON serialization.
+  </Tab>
+
+  <Tab title="Async">
+    **Async** (`mode: async`) publishes the payload to NATS and does **not** wait for the result before `CheckTransaction` makes its decision. The response is received by `ModelResultsHandler` and logged with its `ProbAttack` score and an OpenTelemetry histogram entry (`wace.model.duration.nanoseconds` with `model_mode=async`), but it is never stored in the transaction's results map and never influences the block decision.
+
+    Inside `callPlugins`, async plugins increment a separate `asyncCounter`. A background goroutine waits on the `asyncModelPluginStatus` channel for all async results to arrive, records metrics, then removes the async channel entry. This goroutine runs concurrently with — and independently of — the sync channel logic that `CheckTransaction` waits on.
+
+    **Plugin initialization:** async plugins use the same `InitPluginAsync` signature as sync remote plugins.
+
+    ```yaml
+    modelplugins:
+      - id: "behaviorLogger"
+        plugintype: Everything
+        path: "/opt/wace/plugins/behavior.so"
+        weight: 0.0
+        mode: async
+        params:
+          topic: "audit-events"
+
+    natsurl: "nats://nats-server:4222"
+    ```
+
+    **When to use:** You want to log or audit every request with a slow or external model without adding latency to the blocking decision. Async plugins are also useful for training data collection — they receive every payload but cannot cause false positives.
+  </Tab>
+</Tabs>
+
+## NATS connection setup
+
+Both sync remote and async modes require a running NATS server. WACElib's `PluginManager` establishes a single connection at startup using the `NatsURL` field from `ConfigStore`, which defaults to `"localhost:4222"` if omitted from the configuration file.
+
+```yaml
+# In your WACE configuration file
+natsurl: "nats://nats-server.internal:4222"
+```
+
+The NATS subject conventions are:
+
+- **Inbound** (WACElib → model): subject is the model `id` field (e.g., `deepInspect`)
+- **Outbound** (model → WACElib): subject is `<modelID>/results` (e.g., `deepInspect/results`)
+
+Each remote or async plugin gets a dedicated `ModelResultsHandler` goroutine subscribed to its `<modelID>/results` subject. This goroutine runs for the lifetime of the process.
+
+## Plugin function signatures
+
+WACElib uses Go's `plugin` package to load `.so` files. The exported symbols it looks up depend on the mode:
+
+```go
+// Sync local plugins must export both of these:
+func InitPlugin(params map[string]string, meter metric.Meter) error
+func Process(input ModelInput) (ModelResults, error)
+
+// Sync remote and async plugins must export this instead of InitPlugin:
+func InitPluginAsync(
+    params map[string]string,
+    meter metric.Meter,
+    register func(func(ModelInput) (ModelResults, error)),
+) error
+```
+
+The `register` callback passed to `InitPluginAsync` connects the plugin's process function to `ModelProcessHandler`, which subscribes to the NATS subject and handles inbound payloads.
+
+<Tip>
+Start with sync local plugins during development — they have the simplest deployment story and the fastest feedback loop. Migrate to sync remote when your model outgrows the WACElib process (e.g., requires a GPU or a different runtime), and use async when you want observability data without any impact on request latency.
+</Tip>
+
+<Warning>
+If the NATS server is unavailable when `Init` is called, `PluginManager.New` logs an error but continues loading plugins. However, any sync remote or async plugin will fail silently at runtime when `AddToQueue` attempts to publish — `CheckTransaction` will time out waiting on the sync channel for remote plugins. Ensure your NATS server is healthy before starting WACElib in production.
+</Warning>

@@ -1,0 +1,194 @@
+---
+title: "Model plugin interface: InitPlugin and Process exports"
+description: "Contract for model plugin .so files — export InitPlugin and Process for sync plugins, or InitPluginAsync for async and remote-sync plugins via NATS."
+---
+
+WACElib loads model plugins as Go shared objects (`.so` files) at startup. The `PluginManager` uses Go's `plugin` package to look up exported symbols by name. A model plugin must export either the sync or async entry points depending on its configured `mode`. The correct interface is determined by the `mode` and `remote` fields in the plugin configuration: sync non-remote plugins export `InitPlugin` and `Process`; async plugins and remote-sync plugins export `InitPluginAsync`.
+
+## Entry points by mode
+
+<Tabs>
+  <Tab title="Sync (mode: sync, remote: false)">
+
+Sync plugins are called directly in-process. The `PluginManager` calls `InitPlugin` once at startup and then calls `Process` for every transaction that targets this plugin.
+
+### InitPlugin
+
+```go
+func InitPlugin(params map[string]string, meter metric.Meter) error
+```
+
+Called once when the plugin is loaded. Use this function to load model weights, open connections, or perform any one-time initialisation. Return a non-nil error to signal a fatal initialisation failure; the `PluginManager` logs a warning and skips the plugin.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `params` | `map[string]string` | Key-value pairs from the plugin's `params` block in the configuration YAML. |
+| `meter` | `metric.Meter` | OpenTelemetry meter for recording plugin-level metrics. |
+
+### Process
+
+```go
+func Process(input pluginmanager.ModelInput) (pluginmanager.ModelResults, error)
+```
+
+Called once per transaction for each call to `wace.Analyze` that names this plugin. Runs in its own goroutine; the `PluginManager` waits on a channel for the result.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `input` | `pluginmanager.ModelInput` | Contains the `TransactionId` and the `HTTPPayload` to score. |
+
+Returns a `ModelResults` with `ProbAttack` in `[0.0, 1.0]` and optional `Data`. Return a non-nil error if the plugin cannot process the input; the error is logged and the transaction continues without this plugin's result.
+
+### Minimal sync plugin
+
+```go
+package main
+
+import (
+    "github.com/tilsor/ModSecIntl_wace_lib/pluginmanager"
+    "go.opentelemetry.io/otel/metric"
+)
+
+// InitPlugin initialises the model.
+func InitPlugin(params map[string]string, meter metric.Meter) error {
+    // Load model, open files, etc.
+    return nil
+}
+
+// Process scores a single HTTP transaction.
+func Process(input pluginmanager.ModelInput) (pluginmanager.ModelResults, error) {
+    // Run inference on input.Payload
+    score := runModel(input.Payload)
+    return pluginmanager.ModelResults{
+        ProbAttack: score,
+        Data:       map[string]interface{}{"source": "sync-model"},
+    }, nil
+}
+
+func runModel(payload pluginmanager.HTTPPayload) float64 {
+    // Replace with real inference logic
+    return 0.0
+}
+```
+
+Build command:
+
+```bash
+go build -buildmode=plugin -o mymodel.so ./mymodel
+```
+
+  </Tab>
+  <Tab title="Async / remote-sync (mode: async or remote: true)">
+
+Async plugins and remote-sync plugins communicate with WACElib over NATS. Instead of exporting a `Process` function directly, they receive a registration callback via `InitPluginAsync` and use it to register their processing function. The `PluginManager` then routes calls through NATS.
+
+### InitPluginAsync
+
+```go
+func InitPluginAsync(
+    params       map[string]string,
+    meter        metric.Meter,
+    registerFunc func(func(pluginmanager.ModelInput) (pluginmanager.ModelResults, error)),
+) error
+```
+
+Called once when the plugin is loaded. The plugin must call `registerFunc` exactly once, passing its processing function. The `PluginManager` wraps that function in a NATS subscriber via `ModelProcessHandler`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `params` | `map[string]string` | Key-value configuration pairs from the YAML config. |
+| `meter` | `metric.Meter` | OpenTelemetry meter for plugin-level metrics. |
+| `registerFunc` | `func(func(ModelInput) (ModelResults, error))` | Callback to register the plugin's processing function with the NATS message handler. Call exactly once inside `InitPluginAsync`. |
+
+Return a non-nil error to signal a fatal initialisation failure.
+
+### Minimal async plugin
+
+```go
+package main
+
+import (
+    "github.com/tilsor/ModSecIntl_wace_lib/pluginmanager"
+    "go.opentelemetry.io/otel/metric"
+)
+
+// InitPluginAsync registers the processing function with the NATS handler.
+func InitPluginAsync(
+    params map[string]string,
+    meter metric.Meter,
+    registerFunc func(func(pluginmanager.ModelInput) (pluginmanager.ModelResults, error)),
+) error {
+    // Perform one-time setup
+    if err := loadModel(params); err != nil {
+        return err
+    }
+
+    // Register the processing function — must be called exactly once
+    registerFunc(processInput)
+    return nil
+}
+
+func processInput(input pluginmanager.ModelInput) (pluginmanager.ModelResults, error) {
+    score := runAsyncModel(input.Payload)
+    return pluginmanager.ModelResults{
+        ProbAttack: score,
+        Data:       map[string]interface{}{"source": "async-model"},
+    }, nil
+}
+
+func loadModel(params map[string]string) error { return nil }
+func runAsyncModel(payload pluginmanager.HTTPPayload) float64 { return 0.0 }
+```
+
+Build command:
+
+```bash
+go build -buildmode=plugin -o myasyncmodel.so ./myasyncmodel
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Configuration reference
+
+```yaml
+modelplugins:
+  - id: "my-sync-model"
+    path: "/usr/lib/wace/plugins/my_sync_model.so"
+    plugintype: "RequestHeaders"
+    weight: 1.0
+    mode: sync          # sync (default) — uses InitPlugin + Process
+    params:
+      model_path: "/models/weights.bin"
+
+  - id: "my-async-model"
+    path: "/usr/lib/wace/plugins/my_async_model.so"
+    plugintype: "Everything"
+    weight: 0.5
+    mode: async         # async — uses InitPluginAsync
+    params:
+      batch_size: "32"
+
+  - id: "my-remote-model"
+    path: "/usr/lib/wace/plugins/my_remote_model.so"
+    plugintype: "AllRequest"
+    weight: 0.8
+    mode: sync
+    remote: true        # remote sync — uses InitPluginAsync + NATS
+```
+
+<Warning>
+  Async and remote-sync plugins must be compiled against the same versions of
+  `pluginmanager` and `go.opentelemetry.io/otel/metric` as the WACElib binary.
+  Go plugin ABI requires identical package paths and versions across the host
+  and plugin binaries.
+</Warning>
+
+<Note>
+  WACElib skips (logs a warning for) any plugin whose exported symbol does not
+  match the expected function signature. If a sync plugin is accidentally
+  compiled with the wrong `Process` signature, it will not be invoked but
+  `Init` will not return an error.
+</Note>

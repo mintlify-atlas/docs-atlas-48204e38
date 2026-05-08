@@ -1,0 +1,123 @@
+---
+title: "Configure WACElib: logpath, plugins, and NATS settings"
+description: "Configure WACElib by populating a ConfigFileData struct — typically unmarshalled from YAML — and passing it to the Init function at startup."
+---
+
+WACElib is configured through a `ConfigFileData` struct defined in the `configstore` package. In practice you populate this struct by unmarshalling a YAML file, then pass it to `Init` alongside an OpenTelemetry meter. `Init` validates the configuration, initialises the logger, and loads all declared plugins before the library begins processing transactions.
+
+## Top-level configuration structure
+
+```yaml
+logpath: "/var/log/wace/wace.log"
+loglevel: "INFO"
+natsurl: "localhost:4222"
+modelplugins:
+  - ...
+decisionplugins:
+  - ...
+```
+
+<ParamField body="logpath" type="string" required>
+  Filesystem path for the WACElib log file. The directory must be writable; WACElib will attempt to create the file if it does not already exist. An empty value causes `Init` to return an error.
+</ParamField>
+
+<ParamField body="loglevel" type="string" required>
+  Minimum severity level for log output. Must be one of:
+
+  | Value   | Meaning                                  |
+  | ------- | ---------------------------------------- |
+  | `DEBUG` | Verbose output including per-transaction tracing |
+  | `INFO`  | Informational messages about plugin loading and transaction outcomes |
+  | `WARN`  | Non-fatal issues such as a plugin failing to load |
+  | `ERROR` | Errors that prevent correct operation    |
+
+  Values are case-insensitive. An unrecognised value causes `Init` to return an error.
+</ParamField>
+
+<ParamField body="natsurl" type="string" default="localhost:4222">
+  Connection URL for the NATS messaging server. Required when any model plugin is configured with `remote: true` or `mode: async`. Defaults to `localhost:4222` if omitted.
+</ParamField>
+
+<ParamField body="modelplugins" type="object[]">
+  List of model plugin configurations. Each entry describes one compiled `.so` plugin that analyses a portion of an HTTP transaction. See [Model plugin configuration](/configuration/model-plugins) for the full field reference.
+</ParamField>
+
+<ParamField body="decisionplugins" type="object[]">
+  List of decision plugin configurations. Each entry describes one compiled `.so` plugin that receives aggregated model results and WAF signals and returns a block/allow decision. See [Decision plugin configuration](/configuration/decision-plugins) for the full field reference.
+</ParamField>
+
+## Complete example
+
+The following YAML is representative of a production configuration that runs two model plugins synchronously in the same process and one decision plugin.
+
+```yaml
+---
+logpath: "/var/log/wace/wace.log"
+loglevel: "INFO"
+modelplugins:
+  - id: "trivial"
+    path: "/opt/wace/plugins/model/trivial.so"
+    weight: 1
+    params:
+      d: "sds"
+      b: "dnid"
+      e: "dofnno"
+    plugintype: "Everything"
+  - id: "trivial2"
+    path: "/opt/wace/plugins/model/trivial2.so"
+    weight: 2
+    params:
+      a: "sdsds"
+      b: "sdfjdnid"
+      c: "kfoskdofnno"
+    plugintype: "Everything"
+decisionplugins:
+  - id: "simple"
+    path: "/opt/wace/plugins/decision/simple.so"
+    wafweight: 0.5
+    decisionbalance: 0.5
+```
+
+## Loading configuration in Go
+
+Pass a populated `ConfigFileData` value directly to `Init`. The typical pattern is to unmarshal a YAML file first:
+
+```go
+import (
+    "os"
+
+    "github.com/tilsor/ModSecIntl_wace_lib/configstore"
+    wace "github.com/tilsor/ModSecIntl_wace_lib"
+    "go.opentelemetry.io/otel/metric"
+    "gopkg.in/yaml.v3"
+)
+
+func startWACE(meter metric.Meter, configPath string) error {
+    data, err := os.ReadFile(configPath)
+    if err != nil {
+        return err
+    }
+
+    var cfg configstore.ConfigFileData
+    if err := yaml.Unmarshal(data, &cfg); err != nil {
+        return err
+    }
+
+    return wace.Init(meter, cfg)
+}
+```
+
+<Note>
+  `Init` creates a singleton `ConfigStore`. Calling `Init` a second time without first calling `configstore.Clean()` returns an error. In tests, call `defer configstore.Clean()` after each `Init` to reset state.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Model plugin configuration" icon="cpu" href="/configuration/model-plugins">
+    Field reference for every model plugin option, including plugintype, mode, and remote execution.
+  </Card>
+  <Card title="Decision plugin configuration" icon="scale-balanced" href="/configuration/decision-plugins">
+    Field reference for decision plugins and how they receive WAF signals and model results.
+  </Card>
+</CardGroup>
